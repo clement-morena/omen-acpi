@@ -1207,6 +1207,13 @@ python3 "$ROOT/tests/test_kernel_entries.py"
 printf 'interactive menu checks...\n'
 bash "$ROOT/tests/test_interactive_menus.sh"
 
+printf 'rEFInd stanza checks...\n'
+if [[ -f "$ROOT/scripts/refind_stanza.py" ]]; then
+    python3 "$ROOT/tests/test_refind_stanza.py"
+else
+    printf 'repository-only rEFInd companion is not present in this release archive; skipped\n'
+fi
+
 printf 'release-builder mismatch and updater verify-only checks...\n'
 version_fixture="$work/version-mismatch"
 mkdir -p "$version_fixture"

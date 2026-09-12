@@ -4,6 +4,10 @@ This document is the extended operational reference for OMEN ACPI Toolkit
 v2.4.0. Installation, the minimum safe workflow, stock return,
 recovery limits and removal remain directly in the release `README.md`.
 
+Do not use these commands on the Pop!_OS / rEFInd machine described in
+[`refind.md`](refind.md). That companion is repository-only and is not a
+Limine entry.
+
 ## Command reference
 
 Run `omen-acpi` without arguments to open the interactive dashboard. The same

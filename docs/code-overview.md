@@ -158,6 +158,13 @@ justify changing a hardware-validated path.
 Section comments in the large files mark the main groups: preconditions,
 transformation, legacy parsing, managed ownership, actions and command dispatch.
 
+## rEFInd companion
+
+`scripts/06-refind-s5.sh` is outside the Limine pipeline. It calls the collector
+and the DSDT builder, then appends one rEFInd stanza. It does not call
+`03-manage-limine-entry.sh`, and it is not part of the release archive. Its
+stock-return and driver limits are in [`refind.md`](refind.md).
+
 ## Tests
 
 `tests/run.sh` is the repository entry point. It covers:
@@ -171,6 +178,7 @@ transformation, legacy parsing, managed ownership, actions and command dispatch.
 - stock-recovery ownership, rollback and race cases;
 - standard/LTS reconciliation and migration;
 - the `NVDE` analysis self-test when repository-only documentation is present;
+- the rEFInd stanza edit, when the repository-only companion is present;
 - release manifest, reproducibility and updater verification.
 
 These tests use synthetic filesystems and command doubles. They do not replace

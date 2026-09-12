@@ -21,6 +21,11 @@ remain available and unchanged.
 > prevent Linux from booting or cause instability, data loss, abnormal thermal
 > behaviour or the need for manual recovery.
 
+> **Do not run this Limine toolkit on a Pop!_OS machine that boots with
+> rEFInd.** `omen-acpi` and `install.sh` add Limine entries. The repository-only
+> companion for that layout, including stock return and its limits, is in
+> [`docs/refind.md`](docs/refind.md). It is not in the release archive.
+
 ## What the project changes
 
 The reference firmware exposed two separate problems:
