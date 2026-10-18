@@ -31,6 +31,9 @@ bash "$ROOT/tests/test_check_dsdt_revision.sh"
 printf 'login check...\n'
 bash "$ROOT/tests/test_startup_check.sh"
 
+printf 'current boot check...\n'
+bash "$ROOT/tests/test_current_boot.sh"
+
 if [[ -f "$ROOT/docs/nvde-audit.py" ]]; then
     printf 'NVDE audit self-test...\n'
     python3 "$ROOT/docs/nvde-audit.py" --self-test

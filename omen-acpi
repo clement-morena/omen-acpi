@@ -813,6 +813,31 @@ PY
     printf 'The stock initrd was not modified: %s\n' "$stock"
 }
 
+# rEFInd writes the initrd token with EFI backslashes, for example
+# initrd=\boot\omen-acpi\s5-initrd.img. Match that path after converting
+# separators, and also accept a forward-slash form.
+classify_current_boot() {
+    local path="${1:-/proc/cmdline}"
+    [[ -f "$path" && ! -L "$path" && -r "$path" ]] || {
+        printf 'not-this-stanza\n'
+        return 0
+    }
+    awk '
+        BEGIN { label = "not-this-stanza" }
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^initrd=/) {
+                    initrd = substr($i, 8)
+                    gsub(/\\/, "/", initrd)
+                    if (initrd ~ /(^|\/)omen-acpi\/s5-initrd\.img$/)
+                        label = "s5-test"
+                }
+            }
+        }
+        END { print label }
+    ' "$path"
+}
+
 internal_status() {
     [[ "$EUID" -eq 0 || -r "$REFIND_CONF" ]] || die "Cannot read ${REFIND_CONF}"
     python3 - "$STANZA_PY" "$REFIND_CONF" "$EARLY_CPIO" "$MANIFEST" <<'PY'
@@ -836,12 +861,7 @@ PY
     else
         printf 'manifest=absent\n'
     fi
-    if grep -q 'omen-acpi/s5-initrd.img' /proc/cmdline 2>/dev/null; then
-        printf 'current_boot=s5-test\n'
-        printf 'Select the normal Linux icon on the next boot. rEFInd may remember this choice.\n'
-    else
-        printf 'current_boot=not-this-stanza\n'
-    fi
+    printf 'current_boot=%s\n' "$(classify_current_boot /proc/cmdline)"
 }
 
 internal_remove() {
@@ -934,6 +954,10 @@ case "$command" in
         ;;
     --internal-status)
         internal_status "$@"
+        ;;
+    --internal-current-boot)
+        (($# <= 1)) || die "current boot check takes one cmdline file"
+        classify_current_boot "$@"
         ;;
     --internal-remove)
         internal_remove "$@"
