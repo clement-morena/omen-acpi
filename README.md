@@ -75,7 +75,10 @@ To use another menu name:
 ./omen-acpi install --title "Ubuntu (omen-acpi s5 fix)"
 ```
 
-The default name is `Pop!_OS (omen-acpi s5 fix)`.
+The default name is `Pop!_OS (omen-acpi s5 fix)`. Install appends the running
+kernel version to that name, including when `--title` is set. For kernel
+`7.1.5-76070105-generic` the entry is
+`Pop!_OS (omen-acpi s5 fix) 7.1.5-76070105-generic`.
 
 Install writes:
 
@@ -135,7 +138,8 @@ refuses unless the BIOS is still `F.13`.
 ./omen-acpi repair --title "Ubuntu (omen-acpi s5 fix)"
 ```
 
-Without `--title`, `repair` reuses the `TITLE=` line in the manifest.
+Without `--title`, `repair` reuses the `TITLE=` line in the manifest. With
+`--title`, it uses that name plus the running kernel version.
 
 | Change | What to do |
 | --- | --- |

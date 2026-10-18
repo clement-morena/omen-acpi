@@ -31,6 +31,7 @@ _GUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+_KERNEL_VERSION = re.compile(r"^[0-9A-Za-z._+-]+$")
 
 
 class StanzaError(ValueError):
@@ -52,6 +53,24 @@ def validate_title(title: str) -> str:
 
 def menuentry_line(title: str) -> str:
     return f'menuentry "{validate_title(title)}"'
+
+
+def title_with_kernel(title: str, kernel: str) -> str:
+    """Return a menu title with the kernel version appended.
+
+    ``title`` is the default name or the ``--title`` value. The installed
+    entry always uses that text, a space, and the kernel version.
+    """
+
+    base = validate_title(title)
+    if not isinstance(kernel, str) or _KERNEL_VERSION.fullmatch(kernel) is None:
+        raise StanzaError("kernel version is empty or unsafe")
+    combined = f"{base} {kernel}"
+    if len(combined) > 80:
+        raise StanzaError(
+            "menu title plus kernel version must be at most 80 characters"
+        )
+    return validate_title(combined)
 
 
 def debian_family(os_release: str) -> bool:

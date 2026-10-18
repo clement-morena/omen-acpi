@@ -5,4 +5,6 @@ drops the original CachyOS and Limine installer. `omen-acpi` now installs the
 upstream S5 DSDT override as a rEFInd menu entry on a Debian-based system.
 
 The menu title defaults to `Pop!_OS (omen-acpi s5 fix)` and can be changed
-with `--title` on `install` and `repair`.
+with `--title` on `install` and `repair`. Install appends the running kernel
+version to that title, including when `--title` is set. `repair` appends the
+version when `--title` is passed and otherwise keeps the installed title.

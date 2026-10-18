@@ -63,8 +63,9 @@ Debian-based rEFInd installer for the S5 DSDT override.
             check, if one was enabled.
 
   --title NAME   Menu entry name. Default: ${DEFAULT_TITLE}
-                 install and repair only. repair keeps the installed name
-                 unless --title is passed.
+                 install appends the running kernel version, including when
+                 --title is passed. repair does the same when --title is
+                 passed, and otherwise keeps the installed name.
 
 Stock return is the normal auto-detected Linux icon. rEFInd may remember the
 last selection, so pick that icon again after a test boot. This command does
@@ -109,6 +110,25 @@ parse_title_args() {
         shift
     done
     validate_menu_title
+}
+
+suffix_menu_title() {
+    local version="${VOLUME_KERNEL:-}"
+    [[ -n "$version" ]] || version="$(kernel_version)"
+    MENU_TITLE="$(
+        python3 - "$STANZA_PY" "$MENU_TITLE" "$version" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    print(module.title_with_kernel(sys.argv[2], sys.argv[3]))
+except module.StanzaError as exc:
+    raise SystemExit(str(exc))
+PY
+    )"
 }
 
 check_debian_family() {
@@ -538,6 +558,7 @@ cmd_install() {
     parse_title_args "$@"
     ((EUID != 0)) || die "Run install as the normal user. It will ask for sudo only to write the boot files."
     preflight
+    suffix_menu_title
     for tool in sudo cpio install sha256sum tar; do
         need_cmd "$tool"
     done
@@ -577,6 +598,9 @@ cmd_repair() {
         title_from_manifest
     fi
     preflight
+    if ((TITLE_FROM_USER == 1)); then
+        suffix_menu_title
+    fi
     [[ -f "$EARLY_CPIO" && ! -L "$EARLY_CPIO" ]] \
         || die "The early CPIO is missing. Run install, not repair."
     printf '%s\n' \

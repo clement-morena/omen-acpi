@@ -92,6 +92,37 @@ class RefindStanzaTest(unittest.TestCase):
         with self.assertRaises(refind_stanza.StanzaError):
             refind_stanza.validate_title('bad "title"')
 
+    def test_title_is_suffixed_with_the_kernel_version(self) -> None:
+        kernel = "7.1.5-76070105-generic"
+        default = refind_stanza.title_with_kernel(
+            refind_stanza.DEFAULT_TITLE,
+            kernel,
+        )
+        custom = refind_stanza.title_with_kernel(
+            "Ubuntu (omen-acpi s5 fix)",
+            kernel,
+        )
+        self.assertEqual(
+            default,
+            f"Pop!_OS (omen-acpi s5 fix) {kernel}",
+        )
+        self.assertEqual(custom, f"Ubuntu (omen-acpi s5 fix) {kernel}")
+        self.assertIn(
+            f'menuentry "{custom}" {{',
+            refind_stanza.render_stanza(
+                kernel=kernel,
+                partuuid="bbe69c12-5d12-4cc8-8480-da3ca883be48",
+                loader="/boot/vmlinuz-7.1.5-76070105-generic",
+                initrd="/boot/omen-acpi/s5-initrd.img",
+                options=OPTIONS,
+                title=custom,
+            ),
+        )
+        with self.assertRaises(refind_stanza.StanzaError):
+            refind_stanza.title_with_kernel("Ubuntu (omen-acpi s5 fix)", "6.8 0")
+        with self.assertRaises(refind_stanza.StanzaError):
+            refind_stanza.title_with_kernel("U" * 70, kernel)
+
     def test_debian_family_ids(self) -> None:
         self.assertTrue(refind_stanza.debian_family('ID=debian\n'))
         self.assertTrue(refind_stanza.debian_family('ID=ubuntu\nID_LIKE=debian\n'))
