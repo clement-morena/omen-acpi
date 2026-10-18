@@ -135,5 +135,6 @@ the `WQBZ` method. The builder then checks that:
    semantics.
 
 These are structural and round-trip guarantees about the generated table. The
-real-hardware observations and their limits are recorded separately in
-[`../docs/validation.md`](../docs/validation.md).
+original project's hardware observations were made on CachyOS with Limine.
+This fork does not repeat that boot path. Its install limits are in the
+repository README.

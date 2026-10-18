@@ -9,10 +9,16 @@ export PATH="/usr/bin:/bin"
 
 # Extracts only the decompiled DSDT source needed by this reproduction.
 # Raw ACPI tables are kept in a private temporary directory and deleted on exit.
+# The live DSDT must be the stock HPQOEM 8E35 table at OEM revision 0x01072009.
 
 readonly EXPECTED_PRODUCT="OMEN Gaming Laptop 16-ap0xxx"
 readonly EXPECTED_BOARD="8E35"
 readonly EXPECTED_BIOS="F.13"
+readonly LIVE_DSDT="/sys/firmware/acpi/tables/DSDT"
+readonly ORIGINAL_OEM_ID="HPQOEM"
+readonly ORIGINAL_TABLE_ID="8E35    "
+readonly ORIGINAL_REVISION="0x01072009"
+readonly ACPI_OVERRIDE_TAINT=256
 MACHINE_PRODUCT=""
 MACHINE_BOARD=""
 MACHINE_BIOS=""
@@ -20,7 +26,6 @@ PACKAGE_FORMAT=""
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
-readonly BOOT_PROBE="$SCRIPT_DIR/00-probe-boot.sh"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -34,6 +39,61 @@ need_cmd() {
 usage() {
     printf 'Usage: %s\n' "$0"
     printf 'Extract the local DSDT source for the OMEN ACPI reproduction.\n'
+}
+
+refuse_acpi_override() {
+    local taint
+    [[ -r /proc/sys/kernel/tainted ]] || die "Kernel taint value is unreadable"
+    taint="$(tr -d '[:space:]' < /proc/sys/kernel/tainted)"
+    [[ "$taint" =~ ^[0-9]+$ ]] || die "Kernel taint value is not numeric"
+    if (( (taint & ACPI_OVERRIDE_TAINT) != 0 )); then
+        die "An ACPI table override is already loaded. Boot the normal rEFInd Linux icon and try again."
+    fi
+}
+
+stock_dsdt_sha() {
+    local dsdt_path="$1"
+    [[ -f "$dsdt_path" && ! -L "$dsdt_path" && -r "$dsdt_path" ]] \
+        || die "DSDT is unreadable: $dsdt_path"
+    python3 - "$dsdt_path" "$ORIGINAL_OEM_ID" "$ORIGINAL_TABLE_ID" "$ORIGINAL_REVISION" <<'PY'
+import hashlib
+import struct
+import sys
+from pathlib import Path
+
+path, expected_oem, expected_table, expected_revision = sys.argv[1:]
+expected_revision = int(expected_revision, 0)
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    data = Path(path).read_bytes()
+except OSError:
+    fail(f"DSDT is unreadable: {path}")
+
+if len(data) < 36:
+    fail("DSDT is too short to be a stock table")
+signature = data[0:4]
+length = struct.unpack_from("<I", data, 4)[0]
+try:
+    oem_id = data[10:16].decode("ascii", "strict")
+    table_id = data[16:24].decode("ascii", "strict")
+except UnicodeError:
+    fail("DSDT OEM identity is not the stock HPQOEM 8E35 table")
+revision = struct.unpack_from("<I", data, 24)[0]
+if signature != b"DSDT" or length != len(data) or (sum(data) & 0xFF) != 0:
+    fail("DSDT header or checksum is invalid")
+if oem_id != expected_oem or table_id != expected_table:
+    fail("DSDT OEM identity is not the stock HPQOEM 8E35 table")
+if revision != expected_revision:
+    fail(
+        f"Live DSDT OEM revision is 0x{revision:08X}, expected 0x{expected_revision:08X}. "
+        "Boot the normal rEFInd Linux icon and try again."
+    )
+print(hashlib.sha256(data).hexdigest())
+PY
 }
 
 check_machine() {
@@ -63,6 +123,13 @@ if (($# > 0)); then
             usage
             exit 0
             ;;
+        --internal-stock-dsdt-sha)
+            shift
+            (($# == 1)) || die "--internal-stock-dsdt-sha requires a DSDT path"
+            need_cmd python3
+            stock_dsdt_sha "$1"
+            exit 0
+            ;;
         *)
             usage >&2
             exit 2
@@ -70,17 +137,12 @@ if (($# > 0)); then
     esac
 fi
 
-for command in sudo acpidump acpixtract iasl tar sha256sum mktemp install grep realpath awk; do
+for command in sudo acpidump acpixtract iasl tar sha256sum mktemp install grep realpath awk python3; do
     need_cmd "$command"
 done
 
 check_machine
-[[ -x "$BOOT_PROBE" ]] || die "Boot-state probe not found: $BOOT_PROBE"
-sudo -- "$BOOT_PROBE" --require-stock
-probe_output="$(sudo -- "$BOOT_PROBE" --env)"
-original_dsdt_sha="$(awk -F= '$1 == "DSDT_SHA256" { print $2 }' <<<"$probe_output")"
-[[ "$original_dsdt_sha" =~ ^[0-9a-f]{64}$ ]] \
-    || die "The original DSDT fingerprint could not be recorded"
+refuse_acpi_override
 
 stamp="$(date +%Y%m%d-%H%M%S)"
 temp_base="${TMPDIR:-/tmp}"
@@ -111,6 +173,12 @@ output_dir="$(realpath -- "$output_dir")"
 archive="$output_dir/$package_name.tar.gz"
 
 mkdir -p "$raw_dir" "$package_dir"
+
+[[ -e "$LIVE_DSDT" && ! -L "$LIVE_DSDT" ]] || die "Live DSDT is missing: $LIVE_DSDT"
+sudo -- cat -- "$LIVE_DSDT" > "$raw_dir/live-dsdt.dat"
+original_dsdt_sha="$(stock_dsdt_sha "$raw_dir/live-dsdt.dat")"
+[[ "$original_dsdt_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || die "The original DSDT fingerprint could not be recorded"
 
 printf 'Dumping firmware ACPI tables into a private temporary directory...\n'
 sudo acpidump > "$raw_dir/acpidump.txt"

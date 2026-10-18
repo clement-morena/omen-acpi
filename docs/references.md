@@ -25,12 +25,9 @@ reference machine.
 - [NVIDIA PCI-Express Runtime D3 power management](https://download.nvidia.com/XFree86/Linux-x86_64/570.124.04/README/dynamicpowermanagement.html)
   describes firmware and ACPI dependencies of NVIDIA RTD3 support, including
   `_PR0` and `_PR3`.
-- [Limine configuration reference](https://github.com/Limine-Bootloader/Limine/blob/v12.x/CONFIG.md)
-  documents entries, paths and configuration syntax.
-- [CachyOS boot manager documentation](https://wiki.cachyos.org/configuration/boot_manager_configuration/)
-  describes the distribution integration used by the toolkit.
-- [Arch Linux Pacman manual](https://man.archlinux.org/man/pacman.8.en)
-  documents the package-management interface used for dependencies.
+- [rEFInd configuration file](https://www.rodsbooks.com/refind/configfile.html)
+  documents manual stanzas, `refind_linux.conf`, and the single `initrd` token
+  used by the installer.
 
 ## Related reports
 

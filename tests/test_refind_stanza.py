@@ -73,6 +73,37 @@ class RefindStanzaTest(unittest.TestCase):
         updated = refind_stanza.append_stanza(STOCK, self.stanza())
         self.assertEqual(refind_stanza.remove_stanza(updated), STOCK)
 
+    def test_default_title_and_custom_title(self) -> None:
+        self.assertIn(
+            'menuentry "Pop!_OS (omen-acpi s5 fix)" {',
+            self.stanza(),
+        )
+        custom = refind_stanza.render_stanza(
+            kernel="7.1.5-76070105-generic",
+            partuuid="bbe69c12-5d12-4cc8-8480-da3ca883be48",
+            loader="/boot/vmlinuz-7.1.5-76070105-generic",
+            initrd="/boot/omen-acpi/s5-initrd.img",
+            options=OPTIONS,
+            title="Ubuntu (omen-acpi s5 fix)",
+        )
+        installed = refind_stanza.append_stanza(STOCK, custom)
+        self.assertIn('menuentry "Ubuntu (omen-acpi s5 fix)" {', installed)
+        self.assertEqual(refind_stanza.remove_stanza(installed), STOCK)
+        with self.assertRaises(refind_stanza.StanzaError):
+            refind_stanza.validate_title('bad "title"')
+
+    def test_debian_family_ids(self) -> None:
+        self.assertTrue(refind_stanza.debian_family('ID=debian\n'))
+        self.assertTrue(refind_stanza.debian_family('ID=ubuntu\nID_LIKE=debian\n'))
+        self.assertTrue(
+            refind_stanza.debian_family('ID=pop\nID_LIKE="ubuntu debian"\n')
+        )
+        self.assertTrue(
+            refind_stanza.debian_family('ID=linuxmint\nID_LIKE="ubuntu debian"\n')
+        )
+        self.assertFalse(refind_stanza.debian_family('ID=arch\nID_LIKE=archlinux\n'))
+        self.assertFalse(refind_stanza.debian_family('ID=pop\n'))
+
     def test_linux_conf_options_are_copied_and_initrd_is_rejected(self) -> None:
         text = (
             f'"Boot with standard options"  "{OPTIONS}"\n'

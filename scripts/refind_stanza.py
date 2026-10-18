@@ -1,10 +1,10 @@
 # Copyright (C) 2026 Paolo De Marinis
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Pure rEFInd stanza edits for the Pop!_OS companion.
+"""Pure rEFInd stanza edits.
 
-This module does not read firmware, call iasl, or write a boot file. The
-companion uses it so an install can append one marked block and a removal
-can delete that block without rewriting any other line.
+This module does not read firmware, call iasl, or write a boot file. omen-acpi
+uses it so an install can append one marked block and a removal can delete
+that block without rewriting any other line.
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ import re
 
 BEGIN = "# BEGIN omen-acpi-refind s5"
 END = "# END omen-acpi-refind s5"
-TITLE = 'menuentry "Pop!_OS (omen-acpi s5 test)"'
+DEFAULT_TITLE = "Pop!_OS (omen-acpi s5 fix)"
+_UNSAFE_TITLE = set('"\r\n\\{}')
 
 # Lines that select the default entry, the menu timeout, or what rEFInd scans.
 # An append or removal must leave every one of these lines byte-identical.
@@ -34,6 +35,38 @@ _GUID = re.compile(
 
 class StanzaError(ValueError):
     """The config change would not be an exact owned-block edit."""
+
+
+def validate_title(title: str) -> str:
+    """Return a menu title that can sit inside one quoted rEFInd menuentry."""
+
+    if not isinstance(title, str) or not title or title != title.strip():
+        raise StanzaError("menu title is empty or has surrounding whitespace")
+    if len(title) > 80 or any(char in title for char in _UNSAFE_TITLE):
+        raise StanzaError(
+            "menu title must be 1-80 characters and must not contain "
+            'quotes, braces, or backslashes'
+        )
+    return title
+
+
+def menuentry_line(title: str) -> str:
+    return f'menuentry "{validate_title(title)}"'
+
+
+def debian_family(os_release: str) -> bool:
+    """True when ID or ID_LIKE contains debian or ubuntu.
+
+    Pop!_OS sets ID=pop and ID_LIKE="ubuntu debian", so it matches through
+    ID_LIKE. A distribution that sets neither token does not.
+    """
+
+    tokens: list[str] = []
+    for line in os_release.splitlines():
+        if line.startswith("ID=") or line.startswith("ID_LIKE="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            tokens.extend(value.split())
+    return any(token in {"debian", "ubuntu"} for token in tokens)
 
 
 def protected_lines(text: str) -> tuple[str, ...]:
@@ -82,7 +115,9 @@ def render_stanza(
     loader: str,
     initrd: str,
     options: str,
+    title: str = DEFAULT_TITLE,
 ) -> str:
+    entry = menuentry_line(title)
     for label, value in (
         ("kernel", kernel),
         ("partuuid", partuuid),
@@ -107,7 +142,7 @@ def render_stanza(
         f"# owned=v1 variant=s5 kernel={kernel} partuuid={partuuid}\n"
         "# Experimental. Not the default. Select the normal Linux icon to return to stock.\n"
         "# Single initrd: uncompressed ACPI CPIO concatenated in front of the stock initrd.\n"
-        f"{TITLE} {{\n"
+        f"{entry} {{\n"
         f"    volume {partuuid}\n"
         f"    loader {loader}\n"
         f"    initrd {initrd}\n"
@@ -133,8 +168,16 @@ def replace_owned_stanza(text: str, stanza: str) -> str:
     return updated
 
 
+def _title_line(stanza: str) -> str:
+    for line in stanza.splitlines():
+        if line.startswith('menuentry "'):
+            return line
+    raise StanzaError("stanza has no menuentry")
+
+
 def append_stanza(text: str, stanza: str) -> str:
-    if BEGIN in text or END in text or TITLE in text:
+    title_line = _title_line(stanza)
+    if BEGIN in text or END in text or title_line in text:
         raise StanzaError(
             "refind.conf already contains an omen-acpi stanza; remove it first"
         )
@@ -147,7 +190,7 @@ def append_stanza(text: str, stanza: str) -> str:
         raise StanzaError(
             "append would change default_selection, timeout, or scan options"
         )
-    if not updated.endswith(stanza) or TITLE not in updated:
+    if not updated.endswith(stanza) or title_line not in updated:
         raise StanzaError("append did not place the stanza at the end")
     return updated
 
@@ -162,8 +205,9 @@ def remove_stanza(text: str) -> str:
     end_of_block = end + len(END)
     if text[end_of_block:end_of_block + 1] == "\n":
         end_of_block += 1
+    title_line = _title_line(text[begin:end_of_block])
     updated = text[:begin] + text[end_of_block:]
-    if BEGIN in updated or END in updated or TITLE in updated:
+    if BEGIN in updated or END in updated or title_line in updated:
         raise StanzaError("removal left part of the omen-acpi stanza behind")
     if protected_lines(updated) != protected_lines(text):
         raise StanzaError(

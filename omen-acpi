@@ -3,2177 +3,952 @@
 # Copyright (C) 2026 Paolo De Marinis
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
+# Installs the S5 DSDT override as one rEFInd menu entry on a Debian-based
+# system. It reuses scripts/01-collect-acpi.sh and scripts/02-build-dsdt.sh.
+# Those commands fail closed if the stock DSDT header, _PTS body, or WQBZ
+# loops do not match.
+#
 set -Eeuo pipefail
 umask 077
 export PATH="/usr/bin:/bin"
 
-readonly VERSION="2.4.0"
-readonly APP_NAME="OMEN ACPI Toolkit"
+readonly ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly COLLECT="$ROOT/scripts/01-collect-acpi.sh"
+readonly BUILD="$ROOT/scripts/02-build-dsdt.sh"
+readonly STANZA_PY="$ROOT/scripts/refind_stanza.py"
+readonly DEFAULT_TITLE='Pop!_OS (omen-acpi s5 fix)'
+
 readonly EXPECTED_PRODUCT="OMEN Gaming Laptop 16-ap0xxx"
 readonly EXPECTED_BOARD="8E35"
 readonly EXPECTED_BIOS="F.13"
-readonly S5_ENTRY="zz-omen-acpi-s5-test"
-readonly S5_LTS_ENTRY="zz-omen-acpi-s5-test-lts"
-readonly COMBINED_ENTRY="zz-omen-acpi-combined-test"
-readonly COMBINED_LTS_ENTRY="zz-omen-acpi-combined-test-lts"
-readonly SUDO_BIN="/usr/bin/sudo"
-readonly PACMAN_BIN="/usr/bin/pacman"
-readonly SYSTEMCTL_BIN="/usr/bin/systemctl"
+readonly EXPECTED_NVIDIA_BDF="0000:01:00.0"
+readonly S5_OEM_REVISION="0x0107200A"
 
-readonly SELF_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly REFIND_CONF="/boot/efi/EFI/refind/refind.conf"
+readonly REFIND_LINUX_CONF="/boot/refind_linux.conf"
+readonly PAYLOAD_DIR="/boot/omen-acpi"
+readonly EARLY_CPIO="$PAYLOAD_DIR/s5-early.cpio"
+readonly COMBINED_INITRD="$PAYLOAD_DIR/s5-initrd.img"
+readonly MANIFEST="$PAYLOAD_DIR/s5-manifest.txt"
+readonly CONF_BACKUP="/boot/efi/EFI/refind/refind.conf.omen-acpi-s5-before"
+readonly STARTUP_DESKTOP_NAME="omen-acpi-dsdt-check.desktop"
 
-if [[ -x "$SELF_DIR/scripts/00-probe-boot.sh" ]]; then
-    readonly APP_ROOT="$SELF_DIR"
-elif [[ -x /usr/local/lib/omen-acpi-fix/scripts/00-probe-boot.sh ]]; then
-    readonly APP_ROOT="/usr/local/lib/omen-acpi-fix"
-else
-    printf 'ERROR: the private OMEN ACPI engines could not be found. Reinstall the toolkit.\n' >&2
-    exit 1
-fi
-
-readonly PROBE="$APP_ROOT/scripts/00-probe-boot.sh"
-readonly COLLECTOR="$APP_ROOT/scripts/01-collect-acpi.sh"
-readonly BUILDER="$APP_ROOT/scripts/02-build-dsdt.sh"
-readonly MANAGER="$APP_ROOT/scripts/03-manage-limine-entry.sh"
-readonly STOCK_RECOVERY="$APP_ROOT/scripts/04-stock-recovery.py"
-readonly UNINSTALLER="$APP_ROOT/uninstall.sh"
-
-if (( EUID == 0 )) && [[ "${OMEN_ACPI_TESTING:-0}" != "1" ]]; then
-    printf 'ERROR: run omen-acpi as your normal user, without sudo.\n' >&2
-    printf 'The toolkit asks for administrator access only when an operation needs it.\n' >&2
-    exit 1
-fi
-
-readonly USER_DATA_ROOT="${XDG_DATA_HOME:-${HOME:?HOME is not set}/.local/share}/omen-acpi-fix"
-readonly ARTIFACT_DIR="$USER_DATA_ROOT/private"
-readonly LOG_DIR="$USER_DATA_ROOT/logs"
-readonly USER_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/omen-acpi-fix"
-readonly SOURCE_POINTER="$USER_STATE_ROOT/source.path"
-readonly S5_BUILD_POINTER="$USER_STATE_ROOT/build-s5.path"
-readonly COMBINED_BUILD_POINTER="$USER_STATE_ROOT/build-combined.path"
-readonly STOCK_FINGERPRINT="$USER_STATE_ROOT/stock-dsdt.sha256"
-readonly LAST_LOG_POINTER="$USER_STATE_ROOT/last-log.path"
-readonly PENDING_FILE="$USER_STATE_ROOT/pending-action"
-
-COLOR_ENABLED=0
-UNICODE_ENABLED=0
-ASSUME_YES=0
-UNVALIDATED_CONSENT=0
-unset OMEN_ACPI_UNVALIDATED_OPT_IN
-PLAIN_MODE=0
-STOCK_RECOVERY_PREPARED=0
-STOCK_RECOVERY_STATUS_LABEL="NOT CHECKED"
-SETUP_VARIANT_RESULT=''
-BANNER_VERTICAL='|'
-
-if [[ -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
-    COLOR_ENABLED=1
-fi
-if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *UTF-8* \
-    || "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *utf8* ]]; then
-    UNICODE_ENABLED=1
-fi
-
-ORANGE=''
-CYAN=''
-GREEN=''
-YELLOW=''
-RED=''
-BOLD=''
-DIM=''
-RESET=''
-
-# Output and confirmation
-
-set_palette() {
-    if (( COLOR_ENABLED )); then
-        ORANGE=$'\033[38;5;208m'
-        CYAN=$'\033[38;5;45m'
-        GREEN=$'\033[38;5;42m'
-        YELLOW=$'\033[38;5;220m'
-        RED=$'\033[38;5;196m'
-        BOLD=$'\033[1m'
-        DIM=$'\033[2m'
-        RESET=$'\033[0m'
-    else
-        ORANGE=''
-        CYAN=''
-        GREEN=''
-        YELLOW=''
-        RED=''
-        BOLD=''
-        DIM=''
-        RESET=''
-    fi
-}
-set_palette
+MENU_TITLE="$DEFAULT_TITLE"
+TITLE_FROM_USER=0
 
 die() {
-    printf '%bERROR:%b %s\n' "$RED$BOLD" "$RESET" "$*" >&2
+    printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
-warn() {
-    printf '%bWARNING:%b %s\n' "$YELLOW$BOLD" "$RESET" "$*" >&2
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
-
-info() {
-    printf '%b%s%b\n' "$CYAN" "$*" "$RESET"
-}
-
-success() {
-    printf '%b%s%b\n' "$GREEN" "$*" "$RESET"
-}
-
-section() {
-    printf '\n%b%s%b\n' "$ORANGE$BOLD" "$*" "$RESET"
-}
-
-sanitize_line() {
-    tr -d '\000-\010\013\014\016-\037\177' <<<"${1:-}" | tr -d '\r\n'
-}
-
-ensure_user_directories() {
-    mkdir -p -- "$ARTIFACT_DIR" "$LOG_DIR" "$USER_STATE_ROOT"
-    chmod 0700 "$USER_DATA_ROOT" "$ARTIFACT_DIR" "$LOG_DIR" "$USER_STATE_ROOT"
-}
-
-confirm() {
-    local prompt="$1"
-    local default="${2:-no}"
-    local answer suffix
-
-    if (( ASSUME_YES )); then
-        printf '%s [automatic yes]\n' "$prompt"
-        return 0
-    fi
-    [[ -t 0 ]] || die "This action needs confirmation. Run it from an interactive terminal."
-
-    if [[ "$default" == "yes" ]]; then
-        suffix='[Y/n]'
-    else
-        suffix='[y/N]'
-    fi
-    read -r -p "$prompt $suffix " answer
-    answer="${answer,,}"
-    if [[ -z "$answer" ]]; then
-        [[ "$default" == "yes" ]]
-        return
-    fi
-    [[ "$answer" == "y" || "$answer" == "yes" ]]
-}
-
-confirm_dangerous() {
-    local prompt="$1" default="${2:-no}" saved_assume_yes="$ASSUME_YES" result=1
-    ASSUME_YES=0
-    if confirm "$prompt" "$default"; then
-        result=0
-    fi
-    ASSUME_YES="$saved_assume_yes"
-    return "$result"
-}
-
-pause_for_user() {
-    [[ -t 0 ]] || return 0
-    printf '\n'
-    read -r -p 'Press Enter to continue... ' _
-}
-
-# Machine gate and privileged engine dispatch
-
-machine_values() {
-    MACHINE_PRODUCT="$(sanitize_line "$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)")"
-    MACHINE_BOARD="$(sanitize_line "$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)")"
-    MACHINE_BIOS="$(sanitize_line "$(cat /sys/class/dmi/id/bios_version 2>/dev/null || true)")"
-}
-
-machine_supported() {
-    machine_values
-    [[ "$MACHINE_PRODUCT" == "$EXPECTED_PRODUCT" \
-        && "$MACHINE_BOARD" == "$EXPECTED_BOARD" \
-        && "$MACHINE_BIOS" == "$EXPECTED_BIOS" ]]
-}
-
-machine_readable() {
-    machine_values
-    [[ -n "$MACHINE_PRODUCT" && -n "$MACHINE_BOARD" && -n "$MACHINE_BIOS" ]]
-}
-
-require_transform_machine() {
-    if machine_supported; then
-        return 0
-    fi
-    machine_readable \
-        || die "DMI identity is missing, empty or unreadable; unvalidated opt-in is unavailable."
-    (( UNVALIDATED_CONSENT == 0 )) || return 0
-
-    section "UNVALIDATED / OPT-IN REQUIRED"
-    printf 'Only this reference identity has been validated:\n'
-    printf '  Product: %s\n  Board:   %s\n  BIOS:    %s\n\n' \
-        "$EXPECTED_PRODUCT" "$EXPECTED_BOARD" "$EXPECTED_BIOS"
-    printf 'Detected on this machine:\n'
-    printf '  Product: %s\n  Board:   %s\n  BIOS:    %s\n\n' \
-        "$MACHINE_PRODUCT" "$MACHINE_BOARD" "$MACHINE_BIOS"
-    printf 'This machine is unvalidated. Opting in does not imply compatibility or support.\n'
-    printf 'The toolkit will only attempt the existing v2.1.11 transformations, and all of\n'
-    printf 'their exact structural checks remain mandatory. Many machines will be rejected.\n'
-    printf 'An incompatible ACPI override can cause boot failure, data loss, instability,\n'
-    printf 'abnormal thermal behaviour, battery drain or the need for manual recovery.\n'
-    printf 'By proceeding, you accept full responsibility for these consequences.\n\n'
-    confirm_dangerous "Proceed on this unvalidated machine?" no \
-        || die "Unvalidated-machine opt-in was not granted."
-    UNVALIDATED_CONSENT=1
-    export OMEN_ACPI_UNVALIDATED_OPT_IN=1
-}
-
-run_root_engine() {
-    if (( UNVALIDATED_CONSENT )); then
-        "$SUDO_BIN" -- env OMEN_ACPI_UNVALIDATED_OPT_IN=1 "$@"
-    else
-        "$SUDO_BIN" -- "$@"
-    fi
-}
-
-# Dependency management
-
-declare -a MISSING_PACKAGES=()
-declare -a MISSING_DETAILS=()
-
-dependency_specifications() {
-    local profile="${1:-full}"
-
-    case "$profile" in
-        full|setup|install)
-            cat <<'EOF'
-acpica|acpidump acpixtract iasl
-cpio|cpio
-mkinitcpio|lsinitcpio
-util-linux|findmnt flock dmesg
-python|python3
-diffutils|diff cmp
-findutils|find
-grep|grep
-gzip|zgrep gzip
-gawk|awk
-tar|tar
-sed|sed
-coreutils|sha256sum realpath install mktemp stat od tee wc tr head cat env
-sudo|sudo
-systemd|systemctl journalctl
-limine-entry-tool|limine-entry-tool
-EOF
-            ;;
-        collect)
-            cat <<'EOF'
-acpica|acpidump acpixtract iasl
-mkinitcpio|lsinitcpio
-util-linux|findmnt flock dmesg
-python|python3
-grep|grep
-gawk|awk
-tar|tar
-coreutils|sha256sum realpath install mktemp wc tr head cat
-sudo|sudo
-systemd|systemctl
-EOF
-            ;;
-        build)
-            cat <<'EOF'
-acpica|iasl
-python|python3
-diffutils|diff
-findutils|find
-gzip|gzip
-tar|tar
-sed|sed
-coreutils|sha256sum realpath install mktemp wc tr head cat
-EOF
-            ;;
-        probe)
-            cat <<'EOF'
-util-linux|dmesg
-python|python3
-grep|grep
-gawk|awk
-coreutils|sha256sum wc tr cat
-sudo|sudo
-EOF
-            ;;
-        status)
-            cat <<'EOF'
-util-linux|findmnt flock dmesg
-python|python3
-diffutils|cmp
-grep|grep
-gawk|awk
-coreutils|sha256sum realpath mktemp od wc tr head cat
-sudo|sudo
-EOF
-            ;;
-        remove)
-            cat <<'EOF'
-util-linux|findmnt flock dmesg
-python|python3
-diffutils|cmp
-grep|grep
-gawk|awk
-coreutils|sha256sum realpath install mktemp stat date sync wc tr head cat cp mv
-sudo|sudo
-limine-entry-tool|limine-entry-tool
-EOF
-            ;;
-        reboot-stock)
-            cat <<'EOF'
-mkinitcpio|lsinitcpio
-util-linux|findmnt flock dmesg
-python|python3
-grep|grep
-gawk|awk
-coreutils|sha256sum realpath mktemp wc tr head cat
-sudo|sudo
-systemd|systemctl
-EOF
-            ;;
-        stock-recovery)
-            cat <<'EOF'
-mkinitcpio|lsinitcpio
-util-linux|flock findmnt
-python|python3
-coreutils|sha256sum realpath stat cp mv sync env
-sudo|sudo
-systemd|systemctl
-EOF
-            ;;
-        *)
-            die "Unknown dependency profile: $profile"
-            ;;
-    esac
-}
-
-collect_missing_dependencies() {
-    local profile="${1:-full}"
-    local specification package commands command missing description
-    local -A seen_packages=()
-    local -a specifications=()
-
-    mapfile -t specifications < <(dependency_specifications "$profile")
-
-    MISSING_PACKAGES=()
-    MISSING_DETAILS=()
-    for specification in "${specifications[@]}"; do
-        package="${specification%%|*}"
-        commands="${specification#*|}"
-        missing=''
-        for command in $commands; do
-            if ! command -v "$command" >/dev/null 2>&1; then
-                missing+="${missing:+, }$command"
-            fi
-        done
-        if [[ -n "$missing" && -z "${seen_packages[$package]:-}" ]]; then
-            seen_packages[$package]=1
-            MISSING_PACKAGES+=("$package")
-            description="$package (provides $missing)"
-            MISSING_DETAILS+=("$description")
-        fi
-    done
-}
-
-print_missing_dependencies() {
-    local profile="${1:-full}" item
-    collect_missing_dependencies "$profile"
-    if ((${#MISSING_PACKAGES[@]} == 0)); then
-        success "All required dependencies are available."
-        return 0
-    fi
-
-    warn "${#MISSING_PACKAGES[@]} required package(s) are missing:"
-    for item in "${MISSING_DETAILS[@]}"; do
-        printf '  - %s\n' "$item"
-    done
-    return 1
-}
-
-ensure_admin() {
-    [[ -x "$SUDO_BIN" ]] \
-        || die "sudo is not installed. Install it as root before continuing."
-    if ! "$SUDO_BIN" -n true 2>/dev/null; then
-        info "Administrator access is required for this check."
-        "$SUDO_BIN" -v || die "Administrator authentication failed."
-    fi
-}
-
-install_dependencies() {
-    local profile="${1:-full}" package pending_upgrades remaining_upgrades upgrade_count
-    collect_missing_dependencies "$profile"
-    if ((${#MISSING_PACKAGES[@]} == 0)); then
-        success "All required dependencies are already installed."
-        return 0
-    fi
-
-    section "Missing dependencies"
-    for package in "${MISSING_DETAILS[@]}"; do
-        printf '  - %s\n' "$package"
-    done
-
-    [[ -x "$PACMAN_BIN" ]] \
-        || die "Automatic dependency installation requires Pacman on Arch/CachyOS."
-
-    if ! pending_upgrades="$($PACMAN_BIN -Qu 2>/dev/null)"; then
-        die "Pacman could not determine whether the system has pending upgrades. Run 'sudo pacman -Syu', then retry."
-    fi
-    if [[ -n "$pending_upgrades" ]]; then
-        upgrade_count="$(wc -l <<<"$pending_upgrades" | tr -d '[:space:]')"
-        section "Full system update required"
-        warn "$upgrade_count pending package upgrade(s) were found."
-        printf 'Installing packages against a newer sync database without upgrading the system\n'
-        printf 'would create an unsupported partial-upgrade state.\n\n'
-        printf '%bCommand:%b sudo pacman -Syu\n\n' "$DIM" "$RESET"
-        confirm_dangerous "Run the full system update now?" no \
-            || die "Update required. Run 'sudo pacman -Syu', reboot if requested, then retry."
-        ensure_admin
-        "$SUDO_BIN" "$PACMAN_BIN" -Syu \
-            || die "The full system update failed. Resolve Pacman errors before retrying."
-        if ! remaining_upgrades="$($PACMAN_BIN -Qu 2>/dev/null)"; then
-            die "Pacman could not verify the system state after the update."
-        fi
-        [[ -z "$remaining_upgrades" ]] \
-            || die "Package upgrades still remain after pacman -Syu. Resolve them before installing toolkit dependencies."
-        collect_missing_dependencies "$profile"
-        if ((${#MISSING_PACKAGES[@]} == 0)); then
-            success "System update completed and all required dependencies are available."
-            return 0
-        fi
-    fi
-
-    if [[ " ${MISSING_PACKAGES[*]} " == *' limine-entry-tool '* ]] \
-        && ! "$PACMAN_BIN" -Si -- limine-entry-tool >/dev/null 2>&1; then
-        die "limine-entry-tool is not available in the configured Pacman repositories. Enable the CachyOS repositories and retry."
-    fi
-
-    confirm "Install these packages with Pacman?" yes \
-        || die "Dependency installation was cancelled."
-    ensure_admin
-
-    printf '\n%bCommand:%b sudo pacman -S --needed --' "$DIM" "$RESET"
-    printf ' %q' "${MISSING_PACKAGES[@]}"
-    printf '\n\n'
-    "$SUDO_BIN" "$PACMAN_BIN" -S --needed -- "${MISSING_PACKAGES[@]}" \
-        || die "Pacman could not install the dependencies. Complete a normal full system update, then retry."
-
-    collect_missing_dependencies "$profile"
-    ((${#MISSING_PACKAGES[@]} == 0)) \
-        || die "Some required commands are still unavailable after package installation."
-    success "Dependency check passed."
-}
-
-ensure_dependencies() {
-    local profile="${1:-full}"
-    collect_missing_dependencies "$profile"
-    if ((${#MISSING_PACKAGES[@]} > 0)); then
-        install_dependencies "$profile"
-    fi
-}
-
-# Boot-state inspection
-
-PROBE_STATE="not-checked"
-PROBE_CLEAN=0
-PROBE_REASON="not-checked"
-PROBE_REVISION="unavailable"
-PROBE_SHA256="unavailable"
-PROBE_TAINT="unknown"
-PROBE_LOG_OVERRIDE="unknown"
-PROBE_S5_FORMAT="unknown"
-PROBE_COMBINED_FORMAT="unknown"
-PROBE_ACTIVE_FORMAT="none"
-RECOVERY_ACTIVE=0
-
-parse_probe_output() {
-    local output="$1" key value saved_fingerprint=''
-    local -a fingerprint_lines=()
-
-    PROBE_STATE="unavailable"
-    PROBE_CLEAN=0
-    PROBE_REASON="invalid-probe-output"
-    PROBE_REVISION="unavailable"
-    PROBE_SHA256="unavailable"
-    PROBE_TAINT="unknown"
-    PROBE_LOG_OVERRIDE="unknown"
-    PROBE_S5_FORMAT="unknown"
-    PROBE_COMBINED_FORMAT="unknown"
-    PROBE_ACTIVE_FORMAT="none"
-
-    while IFS='=' read -r key value; do
-        case "$key" in
-            STATE) PROBE_STATE="$value" ;;
-            CLEAN) PROBE_CLEAN="$value" ;;
-            REASON) PROBE_REASON="$value" ;;
-            DSDT_REVISION) PROBE_REVISION="$value" ;;
-            DSDT_SHA256) PROBE_SHA256="$value" ;;
-            TAINT_ACPI) PROBE_TAINT="$value" ;;
-            LOG_OVERRIDE) PROBE_LOG_OVERRIDE="$value" ;;
-            S5_FORMAT) PROBE_S5_FORMAT="$value" ;;
-            COMBINED_FORMAT) PROBE_COMBINED_FORMAT="$value" ;;
-            ACTIVE_FORMAT) PROBE_ACTIVE_FORMAT="$value" ;;
-        esac
-    done <<<"$output"
-
-    case "$PROBE_STATE" in
-        stock|s5|combined|unknown|unsupported|unavailable) ;;
-        *)
-            PROBE_STATE="unavailable"
-            PROBE_CLEAN=0
-            PROBE_REASON="invalid-probe-state"
-            ;;
-    esac
-
-    case "$PROBE_S5_FORMAT" in managed|legacy|conflict|absent) ;; *) PROBE_S5_FORMAT="unknown" ;; esac
-    case "$PROBE_COMBINED_FORMAT" in managed|legacy|conflict|absent) ;; *) PROBE_COMBINED_FORMAT="unknown" ;; esac
-    case "$PROBE_ACTIVE_FORMAT" in managed|legacy|none) ;; *) PROBE_ACTIVE_FORMAT="none" ;; esac
-
-    if [[ "$PROBE_STATE" == "stock" \
-        && ( -e "$STOCK_FINGERPRINT" || -L "$STOCK_FINGERPRINT" ) ]]; then
-        if [[ ! -f "$STOCK_FINGERPRINT" || -L "$STOCK_FINGERPRINT" \
-            || ! -r "$STOCK_FINGERPRINT" ]]; then
-            PROBE_STATE="unknown"
-            PROBE_CLEAN=0
-            PROBE_REASON="stock-fingerprint-invalid"
-        else
-            if ! mapfile -t fingerprint_lines < "$STOCK_FINGERPRINT" \
-                || ((${#fingerprint_lines[@]} != 1)) \
-                || [[ ! "${fingerprint_lines[0]}" =~ ^[0-9a-f]{64}$ ]]; then
-                PROBE_STATE="unknown"
-                PROBE_CLEAN=0
-                PROBE_REASON="stock-fingerprint-invalid"
-            else
-                saved_fingerprint="${fingerprint_lines[0]}"
-                if [[ "$PROBE_SHA256" != "$saved_fingerprint" ]]; then
-                    PROBE_STATE="unknown"
-                    PROBE_CLEAN=0
-                    PROBE_REASON="stock-fingerprint-mismatch"
-                fi
-            fi
-        fi
-    fi
-}
-
-probe_boot() {
-    local output
-    ensure_admin
-    output="$("$SUDO_BIN" -- "$PROBE" --env)" \
-        || die "The current ACPI boot state could not be inspected."
-    parse_probe_output "$output"
-    if [[ "$PROBE_STATE" == "stock" && "$PROBE_CLEAN" == "1" ]] \
-        && "$SUDO_BIN" -- "$STOCK_RECOVERY" active >/dev/null 2>&1; then
-        RECOVERY_ACTIVE=1
-    fi
-}
-
-probe_boot_if_cached() {
-    local output
-    # sudo resets the environment, so OMEN_ACPI_TESTING would not reach the
-    # probe and a test run would inspect the real host instead. Where sudo is
-    # passwordless, that also makes every dashboard redraw shell out to
-    # journalctl and dmesg.
-    if [[ "${OMEN_ACPI_TESTING:-0}" != "1" ]] \
-        && [[ -x "$SUDO_BIN" ]] \
-        && "$SUDO_BIN" -n true 2>/dev/null \
-        && output="$("$SUDO_BIN" -n -- "$PROBE" --env 2>/dev/null)"; then
-        parse_probe_output "$output"
-        return 0
-    fi
-    PROBE_STATE="not-checked"
-    PROBE_CLEAN=0
-    PROBE_REASON="authentication-required"
-    PROBE_REVISION="unavailable"
-    PROBE_S5_FORMAT="unknown"
-    PROBE_COMBINED_FORMAT="unknown"
-    PROBE_ACTIVE_FORMAT="none"
-    return 1
-}
-
-boot_state_label() {
-    case "$PROBE_STATE" in
-        stock)
-            if (( RECOVERY_ACTIVE )); then printf 'STOCK RECOVERY ACTIVE'; else printf 'STOCK / SAFE'; fi
-            ;;
-        s5)
-            if [[ "$PROBE_ACTIVE_FORMAT" == "legacy" ]]; then
-                printf 'LEGACY S5 ACTIVE'
-            else
-                printf 'S5 OVERRIDE ACTIVE'
-            fi
-            ;;
-        combined)
-            if [[ "$PROBE_ACTIVE_FORMAT" == "legacy" ]]; then
-                printf 'LEGACY COMBINED ACTIVE'
-            else
-                printf 'COMBINED OVERRIDE ACTIVE'
-            fi
-            ;;
-        unknown) printf 'UNKNOWN OVERRIDE / BLOCKED' ;;
-        unsupported) printf 'UNSUPPORTED MACHINE' ;;
-        unavailable) printf 'UNVERIFIABLE / BLOCKED' ;;
-        *) printf 'NOT CHECKED' ;;
-    esac
-}
-
-boot_state_color() {
-    case "$PROBE_STATE" in
-        stock) printf '%s' "$GREEN" ;;
-        s5|combined) printf '%s' "$CYAN" ;;
-        unknown|unsupported|unavailable) printf '%s' "$RED" ;;
-        *) printf '%s' "$YELLOW" ;;
-    esac
-}
-
-get_stock_entry() {
-    local title
-    ensure_admin
-    if title="$("$SUDO_BIN" -- "$MANAGER" stock-entry)"; then
-        sanitize_line "$title"
-    else
-        return 1
-    fi
-}
-
-current_boot_id() {
-    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
-        tr -d '[:space:]' < /proc/sys/kernel/random/boot_id
-    else
-        printf 'unavailable'
-    fi
-}
-
-# Resumable workflows and private artifacts
-
-set_pending_action() {
-    local action="$1" variant="${2:-}" temporary
-
-    case "$action:$variant" in
-        setup:s5|setup:combined|setup:both|build:s5|build:combined|build:both|install:s5|install:combined|install:both|collect:)
-            ;;
-        *)
-            die "Refusing to save an invalid pending workflow: $action ${variant:-}"
-            ;;
-    esac
-
-    ensure_user_directories
-    temporary="$(mktemp "$USER_STATE_ROOT/.pending.XXXXXX")"
-    {
-        printf 'ACTION=%s\n' "$action"
-        printf 'VARIANT=%s\n' "$variant"
-        printf 'BOOT_ID=%s\n' "$(current_boot_id)"
-    } > "$temporary"
-    chmod 0600 "$temporary"
-    mv -f -- "$temporary" "$PENDING_FILE"
-}
-
-clear_pending_action() {
-    rm -f -- "$PENDING_FILE"
-}
-
-pending_field() {
-    local requested="$1" key value
-    [[ -r "$PENDING_FILE" && ! -L "$PENDING_FILE" ]] || return 1
-    while IFS='=' read -r key value; do
-        if [[ "$key" == "$requested" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-    done < "$PENDING_FILE"
-    return 1
-}
-
-pending_action() {
-    local action variant
-    action="$(pending_field ACTION 2>/dev/null || true)"
-    variant="$(pending_field VARIANT 2>/dev/null || true)"
-    case "$action:$variant" in
-        setup:s5|setup:combined|setup:both|build:s5|build:combined|build:both|install:s5|install:combined|install:both|collect:)
-            printf '%s\n' "$action"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-pending_variant() {
-    pending_action >/dev/null || return 1
-    pending_field VARIANT
-}
-
-pending_boot_id() {
-    local boot_id
-    pending_action >/dev/null || return 1
-    boot_id="$(pending_field BOOT_ID 2>/dev/null || true)"
-    [[ "$boot_id" =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
-    printf '%s\n' "$boot_id"
-}
-
-pending_description() {
-    local action variant
-    action="$(pending_action)" || return 1
-    variant="$(pending_variant 2>/dev/null || true)"
-    if [[ -n "$variant" ]]; then
-        printf '%s %s\n' "$action" "$variant"
-    else
-        printf '%s\n' "$action"
-    fi
-}
-
-pending_is_same_boot() {
-    local saved_boot
-    saved_boot="$(pending_boot_id 2>/dev/null || true)"
-    [[ -n "$saved_boot" && "$saved_boot" == "$(current_boot_id)" ]]
-}
-
-show_stock_reboot_prompt() {
-    local resume_action="${1:-}" resume_variant="${2:-}" stock_entry
-
-    if [[ "$PROBE_STATE" == "stock" && "$PROBE_CLEAN" == "1" ]]; then
-        success "A clean stock DSDT is already active; no recovery reboot is needed."
-        return 0
-    fi
-
-    if ! stock_entry="$(get_stock_entry)"; then
-        clear_pending_action
-        section "Normal Limine entry could not be verified"
-        printf 'The toolkit could not identify a unique clean CachyOS entry.\n'
-        printf 'Run %bomen-acpi doctor%b and inspect the Limine configuration before rebooting.\n' "$BOLD" "$RESET"
-        return 1
-    fi
-    if [[ -n "$resume_action" ]]; then
-        set_pending_action "$resume_action" "$resume_variant"
-    fi
-
-    section "A stock boot is required"
-    printf '%bCurrent boot:%b %s (%s)\n' "$BOLD" "$RESET" "$(boot_state_label)" "$PROBE_REVISION"
-    printf '%bDetection:%b %s\n' "$BOLD" "$RESET" "$PROBE_REASON"
-    printf 'A clean firmware source cannot be collected and boot entries cannot be installed from this state.\n\n'
-    printf 'Restart the computer and select this normal Limine entry:\n'
-    printf '  %b%s%b\n\n' "$GREEN$BOLD" "$stock_entry" "$RESET"
-    printf 'Do not select:\n'
-    printf '  - %s\n  - %s\n  - %s\n  - %s\n' \
-        "$S5_ENTRY" "$S5_LTS_ENTRY" "$COMBINED_ENTRY" "$COMBINED_LTS_ENTRY"
-    if [[ -n "$resume_action" ]]; then
-        printf '\nRun %bomen-acpi%b again after logging in and choose Resume; the exact workflow was saved.\n' "$BOLD" "$RESET"
-    fi
-
-    if confirm_dangerous "Reboot now?" no; then
-        ensure_admin
-        info "Rebooting. The Limine default is not being changed."
-        "$SUDO_BIN" "$SYSTEMCTL_BIN" reboot \
-            || die "systemd could not start the reboot."
-    fi
-}
-
-require_stock_boot() {
-    local pending_action_name="${1:-}" pending_variant_name="${2:-}"
-    ensure_dependencies probe
-    probe_boot
-    if [[ "$PROBE_STATE" != "stock" || "$PROBE_CLEAN" != "1" ]]; then
-        ensure_dependencies reboot-stock
-        show_stock_reboot_prompt "$pending_action_name" "$pending_variant_name"
-        return 1
-    fi
-    return 0
-}
-
-reboot_stock() {
-    local resume_action="${1:-}" resume_variant="${2:-}"
-    ensure_dependencies probe
-    probe_boot
-    if [[ "$PROBE_STATE" == "stock" && "$PROBE_CLEAN" == "1" ]]; then
-        show_stock_reboot_prompt "$resume_action" "$resume_variant"
-        return 0
-    fi
-    ensure_dependencies reboot-stock
-    show_stock_reboot_prompt "$resume_action" "$resume_variant"
-}
-
-stock_recovery_manager() {
-    run_root_engine "$STOCK_RECOVERY" "$@"
-}
-
-prepare_stock_recovery() {
-    require_transform_machine
-    ensure_dependencies stock-recovery
-    ensure_admin
-    section "Prepare preventive stock recovery"
-    stock_recovery_manager prepare
-    STOCK_RECOVERY_PREPARED=1
-}
-
-prepare_stock_recovery_interactive() {
-    require_transform_machine
-    probe_boot
-    if [[ "$PROBE_STATE" != "stock" || "$PROBE_CLEAN" != "1" ]]; then
-        die "A preventive recovery snapshot can only be created during a clean verified stock boot."
-    fi
-    section "Create or refresh preventive recovery snapshot"
-    printf 'This will copy the verified stock kernel and initramfs into a reserved directory on the ESP\n'
-    printf 'and write its root-owned integrity-checked manifest under /var/lib. No Limine default is changed.\n\n'
-    confirm_dangerous "Create or refresh the preventive recovery snapshot?" no || return 0
-    prepare_stock_recovery
-}
-
-stock_recovery_status() {
-    local output
-    if [[ "${OMEN_ACPI_TESTING:-0}" != "1" && -x "$SUDO_BIN" ]] \
-        && "$SUDO_BIN" -n true 2>/dev/null \
-        && output="$("$SUDO_BIN" -n -- "$STOCK_RECOVERY" status 2>/dev/null)"; then
-        printf '%s\n' "$output"
-    else
-        printf 'UNAVAILABLE\tNot checked'
-    fi
-}
-
-stock_recovery_snapshot_status() {
-    local output="${1:-}" snapshot=''
-    snapshot="$(awk -F '\t' '$1 == "SNAPSHOT" { print $2; exit }' <<<"$output")"
-    printf '%s\n' "${snapshot:-unavailable}"
-}
-
-recover_stock() {
-    local result kind title
-    probe_boot
-    if [[ "$PROBE_STATE" == "stock" && "$PROBE_CLEAN" == "1" ]]; then
-        success "A clean stock DSDT is already active; no recovery is needed."
-        return 0
-    fi
-    case "$PROBE_STATE" in
-        s5|combined) ;;
-        *) die "The current boot state is ambiguous or unverifiable; automatic recovery is blocked." ;;
-    esac
-    ensure_dependencies stock-recovery
-    ensure_admin
-    local preview
-    preview="$(stock_recovery_manager status 2>/dev/null || true)"
-    if grep -Fxq $'SNAPSHOT\trefresh-required' <<<"$preview"; then
-        if grep -Fxq $'NORMAL_ENTRY\tavailable' <<<"$preview"; then
-            warn "The 2.1.10 recovery snapshot is untrusted for boot and will be preserved, not used."
-            info "The verified normal linux-cachyos entry will be used for the stock reboot."
-        else
-            die "The 2.1.10 recovery snapshot is untrusted and no usable unambiguous normal stock entry is available. Automatic recovery is blocked; use external recovery media."
-        fi
-    fi
-    if grep -Fxq $'NORMAL_ENTRY\tmissing' <<<"$preview" \
-        && grep -Fxq $'SNAPSHOT\tvalid' <<<"$preview"; then
-        printf 'The normal stock entry is missing. The managed %s entry will be created\n' \
-            'zz-omen-acpi-stock-recovery'
-        printf 'from the verified snapshot. The Limine default will not be changed.\n\n'
-        confirm_dangerous "Create or restore the managed stock recovery entry?" no || return 0
-    fi
-    result="$(stock_recovery_manager recover)" \
-        || die "Automatic stock recovery is unavailable. If no snapshot was prepared before the normal entry disappeared, use external manual recovery media."
-    IFS=$'\t' read -r kind title <<<"$result"
-    case "$kind" in
-        NORMAL)
-            info "The normal stock entry still exists and was not modified."
-            if grep -Fxq $'SNAPSHOT\trefresh-required' <<<"$preview"; then
-                info "After booting stock, choose recovery option 1 to create a trusted 2.4.0 snapshot."
-            fi
-            show_stock_reboot_prompt
-            ;;
-        CREATED|READY)
-            section "Stock recovery ready"
-            printf 'At the next Limine menu select exactly:\n\n  %b%s%b\n\n' "$GREEN$BOLD" "$title" "$RESET"
-            printf 'The default entry and every other Limine entry were preserved.\n'
-            if confirm_dangerous "Reboot now to select the stock recovery entry?" no; then
-                "$SUDO_BIN" "$SYSTEMCTL_BIN" reboot || die "systemd could not start the reboot."
-            fi
-            ;;
-        *) die "The stock recovery manager returned an invalid result." ;;
-    esac
-}
-
-remove_stock_recovery() {
-    ensure_dependencies stock-recovery
-    section "Remove managed stock recovery"
-    printf 'This removes only the owned zz-omen-acpi-stock-recovery entry, its copied payloads,\n'
-    printf 'and its integrity-checked manifest. A valid normal linux-cachyos entry with verified\n'
-    printf 'kernel and override-free initramfs payloads is required.\n'
-    printf 'Existing normal and experimental entries are not edited.\n\n'
-    confirm_dangerous "Remove the managed recovery snapshot and entry?" no || return 0
-    ensure_admin
-    stock_recovery_manager remove
-}
-
-show_stock_recovery_details() {
-    local output
-    ensure_dependencies stock-recovery
-    ensure_admin
-    section "Detailed stock recovery status"
-    if ! output="$(stock_recovery_manager status)"; then
-        warn "Recovery status is unavailable; no changes were made."
-        return 1
-    fi
-    awk -F '\t' '
-        $1 == "BOOT" { print "Current boot: " $2 }
-        $1 == "DSDT_REVISION" { print "DSDT revision: " $2 }
-        $1 == "DETECTION" { print "Detection: " $2 }
-        $1 == "SNAPSHOT" { print "Preventive snapshot: " $2 }
-        $1 == "SNAPSHOT_CREATED" { print "Snapshot date: " $2 }
-        $1 == "SNAPSHOT_VERSION" { print "Snapshot version: " $2 }
-        $1 == "KERNEL" { print "Saved kernel: " $2 }
-        $1 == "MODULES" { print "Saved modules: " $2 }
-        $1 == "HASHES" { print "Snapshot integrity/trust: " $2 }
-        $1 == "NORMAL_ENTRY" { print "Normal stock entry: " $2 }
-        $1 == "RECOVERY_ENTRY" { print "Managed recovery entry: " $2 }
-        $1 == "RECOMMENDATION" { print "Recommended action: " $2 }
-    ' <<<"$output"
-}
-
-stock_recovery_menu() {
-    local choice output boot_label snapshot_label normal_label recovery_label
-    while true; do
-        ensure_dependencies probe
-        probe_boot_if_cached || true
-        boot_label="$(boot_state_label)"
-        snapshot_label='unavailable'; normal_label='unavailable'; recovery_label='unavailable'
-        if output="$(stock_recovery_status 2>/dev/null)"; then
-            snapshot_label="$(awk -F '\t' '$1=="SNAPSHOT" {print $2; exit}' <<<"$output")"
-            normal_label="$(awk -F '\t' '$1=="NORMAL_ENTRY" {print $2; exit}' <<<"$output")"
-            recovery_label="$(awk -F '\t' '$1=="RECOVERY_ENTRY" {print $2; exit}' <<<"$output")"
-        fi
-        section "Stock boot and recovery"
-        printf 'Current boot: %s\n' "$boot_label"
-        printf 'Preventive snapshot: %s\n' "${snapshot_label:-unavailable}"
-        printf 'Normal stock entry: %s\n' "${normal_label:-unavailable}"
-        printf 'Managed recovery entry: %s\n\n' "${recovery_label:-unavailable}"
-        printf '  1. Create or refresh the preventive recovery snapshot\n'
-        printf '     Save a verified stock kernel and initramfs for future recovery.\n'
-        printf '     This requires a clean stock boot.\n\n'
-        printf '  2. Recover or reboot into a stock boot\n'
-        printf '     Use the normal entry when available.\n'
-        printf '     Only a current trusted snapshot can recreate a missing recovery entry.\n'
-        printf '     Legacy refresh-required snapshots are never used for automatic recovery.\n\n'
-        printf '  3. Show detailed recovery status\n\n'
-        printf '  4. Remove the managed recovery snapshot and entry\n\n'
-        printf '  b. Back\n\n'
-        if ! read -r -p 'Selection: ' choice; then
-            printf '\n'
-            return 0
-        fi
-        case "$choice" in
-            1) ( prepare_stock_recovery_interactive ) || true; pause_for_user ;;
-            2) ( recover_stock ) || true; pause_for_user ;;
-            3) ( show_stock_recovery_details ) || true; pause_for_user ;;
-            4) ( remove_stock_recovery ) || true; pause_for_user ;;
-            b|B) return 0 ;;
-            *) warn "Invalid selection." ;;
-        esac
-    done
-}
-
-write_pointer() {
-    local pointer="$1" value="$2" temporary
-    ensure_user_directories
-    temporary="$(mktemp "$USER_STATE_ROOT/.pointer.XXXXXX")"
-    printf '%s\n' "$value" > "$temporary"
-    chmod 0600 "$temporary"
-    mv -f -- "$temporary" "$pointer"
-}
-
-artifact_is_private() {
-    local path="$1" resolved_root resolved
-    [[ -f "$path" && ! -L "$path" ]] || return 1
-    resolved_root="$(realpath -- "$ARTIFACT_DIR")"
-    resolved="$(realpath -- "$path")"
-    [[ "$resolved" == "$resolved_root"/* ]]
-}
-
-latest_artifact() {
-    local pointer="$1" pattern="$2" candidate='' file
-    if [[ -r "$pointer" ]]; then
-        candidate="$(head -n 1 -- "$pointer")"
-        if artifact_is_private "$candidate"; then
-            printf '%s\n' "$(realpath -- "$candidate")"
-            return 0
-        fi
-        candidate=''
-    fi
-
-    shopt -s nullglob
-    for file in "$ARTIFACT_DIR"/$pattern; do
-        if [[ -z "$candidate" || "$file" > "$candidate" ]]; then
-            candidate="$file"
-        fi
-    done
-    shopt -u nullglob
-    [[ -n "$candidate" ]] || return 1
-    printf '%s\n' "$(realpath -- "$candidate")"
-}
-
-latest_source() {
-    latest_artifact "$SOURCE_POINTER" 'omen-*-acpi-source-*.tar.gz'
-}
-
-build_pointer_for() {
-    case "$1" in
-        s5) printf '%s\n' "$S5_BUILD_POINTER" ;;
-        combined) printf '%s\n' "$COMBINED_BUILD_POINTER" ;;
-        *) return 1 ;;
-    esac
-}
-
-latest_build() {
-    local variant="$1"
-    latest_artifact "$(build_pointer_for "$variant")" "omen-dsdt-*-${variant}-build-*.tar.gz"
-}
-
-# Collection, build and managed-entry lifecycle
-
-run_logged() {
-    local label="$1"
-    shift
-    local stamp log_file rc
-    local -a statuses
-
-    ensure_user_directories
-    stamp="$(date +%Y%m%d-%H%M%S)"
-    log_file="$LOG_DIR/${stamp}-${label}.log"
-    : > "$log_file"
-    chmod 0600 "$log_file"
-    write_pointer "$LAST_LOG_POINTER" "$log_file"
-
-    set +e
-    "$@" 2>&1 | tee "$log_file"
-    statuses=("${PIPESTATUS[@]}")
-    set -e
-    rc="${statuses[0]}"
-    if (( rc != 0 )); then
-        warn "The operation failed. Private log: $log_file"
-    fi
-    return "$rc"
-}
-
-capture_source() {
-    local resume_action="${1:-collect}" resume_variant="${2:-}"
-    local preserve_pending="${3:-0}" result_file source_path
-    require_transform_machine
-    require_stock_boot "$resume_action" "$resume_variant" || return 4
-    ensure_dependencies collect
-    ensure_user_directories
-
-    section "Collect original ACPI source"
-    printf 'Only the decompiled DSDT source and minimal metadata will be retained.\n'
-    printf 'Raw ACPI tables and temporary logs are deleted automatically.\n\n'
-
-    result_file="$(mktemp "$USER_STATE_ROOT/.collect-result.XXXXXX")"
-    if ! run_logged collect env \
-        OMEN_ACPI_OUTPUT_DIR="$ARTIFACT_DIR" \
-        OMEN_ACPI_RESULT_FILE="$result_file" \
-        "$COLLECTOR"; then
-        rm -f -- "$result_file"
-        return 1
-    fi
-
-    source_path="$(head -n 1 -- "$result_file" 2>/dev/null || true)"
-    rm -f -- "$result_file"
-    artifact_is_private "$source_path" \
-        || die "The collector did not return a valid private source archive."
-
-    write_pointer "$SOURCE_POINTER" "$(realpath -- "$source_path")"
-    if [[ "$PROBE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-        write_pointer "$STOCK_FINGERPRINT" "$PROBE_SHA256"
-    fi
-    if [[ "$preserve_pending" != "1" ]]; then
-        clear_pending_action
-    fi
-    LAST_SOURCE_ARCHIVE="$(realpath -- "$source_path")"
-    success "Clean source captured and fingerprinted."
-    printf 'Private archive: %s\n' "$LAST_SOURCE_ARCHIVE"
-}
-
-normalize_variant() {
-    case "${1:-}" in
-        s5|combined|both|all) printf '%s\n' "$1" ;;
-        *) die "Variant must be s5, combined or both." ;;
-    esac
-}
-
-build_one() {
-    local variant="$1" source_archive="${2:-}" result_file build_path pointer
-    require_transform_machine
-    ensure_user_directories
-
-    if [[ -z "$source_archive" ]]; then
-        source_archive="$(latest_source 2>/dev/null || true)"
-    fi
-    if [[ -z "$source_archive" ]]; then
-        info "No private source archive is available yet."
-        capture_source build "$variant" || return
-        source_archive="$LAST_SOURCE_ARCHIVE"
-    fi
-    [[ -f "$source_archive" ]] || die "Source archive not found: $source_archive"
-    ensure_dependencies build
-
-    section "Build $variant variant"
-    result_file="$(mktemp "$USER_STATE_ROOT/.build-result.XXXXXX")"
-    if ! run_logged "build-$variant" env \
-        OMEN_ACPI_OUTPUT_DIR="$ARTIFACT_DIR" \
-        OMEN_ACPI_RESULT_FILE="$result_file" \
-        "$BUILDER" "$variant" "$source_archive"; then
-        rm -f -- "$result_file"
-        return 1
-    fi
-
-    build_path="$(head -n 1 -- "$result_file" 2>/dev/null || true)"
-    rm -f -- "$result_file"
-    artifact_is_private "$build_path" \
-        || die "The builder did not return a valid private build archive."
-    pointer="$(build_pointer_for "$variant")"
-    write_pointer "$pointer" "$(realpath -- "$build_path")"
-    LAST_BUILD_ARCHIVE="$(realpath -- "$build_path")"
-    success "$variant build completed and verified."
-}
-
-build_variants() {
-    local requested source_archive="${2:-}"
-    requested="$(normalize_variant "$1")"
-    case "$requested" in
-        s5|combined)
-            build_one "$requested" "$source_archive"
-            ;;
-        both|all)
-            if [[ -z "$source_archive" ]]; then
-                source_archive="$(latest_source 2>/dev/null || true)"
-            fi
-            if [[ -z "$source_archive" ]]; then
-                [[ "$requested" != "all" ]] || requested="both"
-                capture_source build "$requested" || return
-                source_archive="$LAST_SOURCE_ARCHIVE"
-            fi
-            build_one s5 "$source_archive"
-            build_one combined "$source_archive"
-            ;;
-    esac
-}
-
-variant_installed() {
-    case "$1" in
-        s5) [[ -d /var/lib/omen-acpi-s5-test ]] ;;
-        combined) [[ -d /var/lib/omen-acpi-combined-test ]] ;;
-        *) return 1 ;;
-    esac
-}
-
-variant_probe_format() {
-    case "$1" in
-        s5) printf '%s\n' "$PROBE_S5_FORMAT" ;;
-        combined) printf '%s\n' "$PROBE_COMBINED_FORMAT" ;;
-        *) return 1 ;;
-    esac
-}
-
-inspect_variant_schema() {
-    local variant="$1" output rc=0 schema
-    ensure_admin
-    if output="$("$SUDO_BIN" -- "$MANAGER" inspect "$variant")"; then
-        rc=0
-    else
-        rc=$?
-    fi
-    schema="$(awk -F= '$1 == "SCHEMA" { print $2 }' <<<"$output")"
-    case "$schema" in
-        managed|legacy|absent)
-            (( rc == 0 )) || die "Could not verify the $variant installation format."
-            ;;
-        conflict)
-            (( rc == 3 )) || die "Could not verify the $variant installation format."
-            ;;
-        *)
-            die "The manager returned an invalid installation format for $variant."
-            ;;
-    esac
-    printf '%s\n' "$schema"
-}
-
-refine_installation_formats_cached() {
-    local variant output rc schema
-    # Same reason as probe_boot_if_cached: never reach sudo from a test run.
-    [[ "${OMEN_ACPI_TESTING:-0}" != "1" ]] || return 0
-    [[ -x "$SUDO_BIN" ]] || return 0
-    "$SUDO_BIN" -n true 2>/dev/null || return 0
-
-    for variant in s5 combined; do
-        rc=0
-        if output="$("$SUDO_BIN" -n -- "$MANAGER" inspect "$variant" 2>/dev/null)"; then
-            rc=0
-        else
-            rc=$?
-        fi
-        schema="$(awk -F= '$1 == "SCHEMA" { print $2 }' <<<"$output")"
-        case "$schema:$rc" in
-            managed:0|legacy:0|absent:0|conflict:3)
-                if [[ "$variant" == "s5" ]]; then
-                    PROBE_S5_FORMAT="$schema"
-                else
-                    PROBE_COMBINED_FORMAT="$schema"
-                fi
-                ;;
-        esac
-    done
-}
-
-variant_dashboard_status() {
-    case "$(variant_probe_format "$1")" in
-        managed) printf 'INSTALLED' ;;
-        legacy) printf 'LEGACY / REINSTALL' ;;
-        conflict) printf 'CONFLICT / BLOCKED' ;;
-        absent) printf 'NOT INSTALLED' ;;
-        *)
-            if variant_installed "$1"; then
-                printf 'PRESENT / CHECK'
-            else
-                printf 'NOT CHECKED'
-            fi
-            ;;
-    esac
-}
-
-variant_dashboard_color() {
-    case "$(variant_probe_format "$1")" in
-        managed) printf '%s' "$CYAN" ;;
-        legacy) printf '%s' "$YELLOW" ;;
-        conflict) printf '%s' "$RED" ;;
-        *) printf '%s' "$DIM" ;;
-    esac
-}
-
-install_one() {
-    local variant="$1" build_archive="${2:-}" schema
-    schema="$(inspect_variant_schema "$variant")"
-    case "$schema" in
-        managed)
-            section "Refresh $variant Limine entries"
-            ensure_admin
-            run_logged "refresh-$variant" "$SUDO_BIN" -- "$MANAGER" refresh "$variant"
-            return
-            ;;
-        legacy) die "The $variant entry uses the old legacy format. Remove it first, then run a fresh managed install." ;;
-        conflict) die "The $variant paths contain an unrecognised or modified installation. Run status; no automatic write is allowed." ;;
-        absent) ;;
-    esac
-    if (( STOCK_RECOVERY_PREPARED == 0 )); then
-        prepare_stock_recovery
-    fi
-    if [[ -z "$build_archive" ]]; then
-        build_archive="$(latest_build "$variant" 2>/dev/null || true)"
-    fi
-    if [[ -z "$build_archive" ]]; then
-        build_one "$variant"
-        build_archive="$LAST_BUILD_ARCHIVE"
-    fi
-    [[ -f "$build_archive" ]] || die "Build archive not found: $build_archive"
-
-    section "Install $variant Limine entry"
-    ensure_admin
-    run_logged "install-$variant" run_root_engine "$MANAGER" install "$variant" "$build_archive"
-}
-
-refresh_one() {
-    local variant="$1" schema
-    schema="$(inspect_variant_schema "$variant")"
-    case "$schema" in
-        absent) info "$variant is not installed."; return 0 ;;
-        conflict) die "$variant contains unrecognised or modified state; automatic refresh is blocked." ;;
-        legacy) die "$variant uses the pre-managed legacy format; remove it normally, then install again." ;;
-        managed) ;;
-    esac
-    ensure_admin
-    run_logged "refresh-$variant" "$SUDO_BIN" -- "$MANAGER" refresh "$variant"
-}
-
-refresh_variants() {
-    local requested rc=0 item_rc=0
-    requested="$(normalize_variant "${1:-all}")"
-    ensure_dependencies status
-    case "$requested" in
-        s5|combined)
-            refresh_one "$requested"
-            ;;
-        both|all)
-            refresh_one s5 || item_rc=$?
-            (( item_rc > rc )) && rc=$item_rc
-            item_rc=0
-            refresh_one combined || item_rc=$?
-            (( item_rc > rc )) && rc=$item_rc
-            ;;
-    esac
-    return "$rc"
-}
-
-install_variants() {
-    local requested build_archive="${2:-}" first_schema second_schema
-    requested="$(normalize_variant "$1")"
-    if [[ -n "$build_archive" && "$requested" != "s5" && "$requested" != "combined" ]]; then
-        die "An explicit build archive can only be used with one variant."
-    fi
-    if [[ -n "$build_archive" ]]; then
-        [[ -f "$build_archive" ]] || die "Build archive not found: $build_archive"
-        build_archive="$(realpath -- "$build_archive")"
-    fi
-    case "$requested" in
-        s5|combined)
-            first_schema="$(inspect_variant_schema "$requested")"
-            if [[ "$first_schema" == "managed" ]]; then
-                refresh_one "$requested"
-                return
-            fi
-            ;;
-        both|all)
-            first_schema="$(inspect_variant_schema s5)"
-            second_schema="$(inspect_variant_schema combined)"
-            if [[ "$first_schema" == "managed" && "$second_schema" == "managed" ]]; then
-                refresh_variants all
-                return
-            fi
-            ;;
-    esac
-    require_transform_machine
-    if [[ -n "$build_archive" ]]; then
-        ensure_dependencies probe
-        probe_boot
-        if [[ "$PROBE_STATE" != "stock" || "$PROBE_CLEAN" != "1" ]]; then
-            ensure_dependencies reboot-stock
-            clear_pending_action
-            printf '\nThe external build archive was not saved in pending state.\n'
-            printf 'After the stock boot, rerun this exact command:\n  '
-            printf '%q ' omen-acpi install "$requested" "$build_archive"
-            printf '\n\n'
-            show_stock_reboot_prompt || return 4
-            return 4
-        fi
-    else
-        require_stock_boot install "$requested" || return 4
-    fi
-    ensure_dependencies install
-
-    case "$requested" in
-        s5|combined)
-            install_one "$requested" "$build_archive"
-            ;;
-        both|all)
-            install_one s5
-            install_one combined
-            ;;
-    esac
-}
-
-remove_one() {
-    local variant="$1" schema
-    schema="$(inspect_variant_schema "$variant")"
-    if [[ "$schema" == "absent" ]]; then
-        info "$variant is not installed."
-        return 0
-    fi
-    [[ "$schema" != "conflict" ]] \
-        || die "$variant contains unrecognised or modified state; automatic removal is blocked."
-    probe_boot
-    if [[ "$PROBE_STATE" == "$variant" ]]; then
-        warn "The $variant DSDT is active in the running kernel."
-        warn "Removing its boot entry will not unload it; you must reboot afterward."
-    fi
-    confirm_dangerous "Remove the $schema $variant Limine entry?" no || return 0
-    ensure_admin
-    run_logged "remove-$variant" "$SUDO_BIN" -- "$MANAGER" remove "$variant"
-}
-
-remove_variants() {
-    local requested
-    requested="$(normalize_variant "${1:-all}")"
-    if ! machine_supported; then
-        warn "The current machine or BIOS no longer matches the supported target."
-        warn "Safe removal is still allowed because the manager verifies exact ownership state."
-    fi
-    ensure_dependencies remove
-    case "$requested" in
-        s5|combined) remove_one "$requested" ;;
-        both|all)
-            remove_one s5
-            remove_one combined
-            ;;
-    esac
-}
-
-status_one() {
-    local variant="$1" rc=0
-    section "Status: $variant"
-    ensure_admin
-    if "$SUDO_BIN" -- "$MANAGER" status "$variant"; then
-        return 0
-    else
-        rc=$?
-        if (( rc == 3 )); then
-            if [[ "$(variant_probe_format "$variant")" == "legacy" ]]; then
-                warn "$variant is a recognised legacy entry; remove it before a fresh managed install."
-            elif [[ "$(variant_probe_format "$variant")" == "managed" ]]; then
-                warn "$variant has stale, missing or obsolete per-kernel entries; run 'omen-acpi refresh $variant'."
-            else
-                warn "$variant requires attention; modified or ambiguous state remains blocked."
-            fi
-            return 3
-        fi
-        warn "Status check for $variant failed with exit code $rc."
-        return "$rc"
-    fi
-}
-
-status_variants() {
-    local requested rc=0 item_rc=0 recovery_output snapshot_status
-    requested="$(normalize_variant "${1:-all}")"
-    ensure_dependencies status
-    probe_boot
-    refine_installation_formats_cached
-    section "Current boot"
-    printf 'State: %b%s%b\n' "$(boot_state_color)$BOLD" "$(boot_state_label)" "$RESET"
-    recovery_output="$(stock_recovery_status)"
-    snapshot_status="$(stock_recovery_snapshot_status "$recovery_output")"
-    printf 'Stock recovery: %s\n' "$snapshot_status"
-    printf 'Active DSDT revision: %s\n' "$PROBE_REVISION"
-    printf 'Detection reason: %s\n' "$PROBE_REASON"
-
-    case "$requested" in
-        s5|combined)
-            status_one "$requested" || rc=$?
-            ;;
-        both|all)
-            status_one s5 || item_rc=$?
-            (( item_rc > rc )) && rc=$item_rc
-            item_rc=0
-            status_one combined || item_rc=$?
-            (( item_rc > rc )) && rc=$item_rc
-            ;;
-    esac
-    return "$rc"
-}
-
-show_artifacts() {
-    local source s5_build combined_build
-    ensure_user_directories
-    source="$(latest_source 2>/dev/null || true)"
-    s5_build="$(latest_build s5 2>/dev/null || true)"
-    combined_build="$(latest_build combined 2>/dev/null || true)"
-
-    section "Private artifacts"
-    printf 'Directory: %s\n\n' "$ARTIFACT_DIR"
-    printf 'Source:    %s\n' "${source:-not available}"
-    printf 'S5 build:  %s\n' "${s5_build:-not available}"
-    printf 'Combined:  %s\n' "${combined_build:-not available}"
-    printf '\nThese machine-derived files are private by default. Review them before sharing.\n'
-}
-
-show_last_log() {
-    local path
-    [[ -r "$LAST_LOG_POINTER" ]] || die "No operation log has been recorded yet."
-    path="$(head -n 1 -- "$LAST_LOG_POINTER")"
-    [[ -f "$path" && ! -L "$path" ]] || die "The last log is no longer available."
-    section "Last private operation log"
-    printf 'File: %s\n\n' "$path"
-    sed -n '1,400p' -- "$path"
-}
-
-secure_boot_state() {
-    local efivar value output
-
-    if [[ ! -d /sys/firmware/efi ]]; then
-        printf 'UEFI unavailable\n'
-        return 0
-    fi
-    if command -v od >/dev/null 2>&1; then
-        shopt -s nullglob
-        for efivar in /sys/firmware/efi/efivars/SecureBoot-*; do
-            value="$(od -An -t u1 -j 4 -N 1 "$efivar" 2>/dev/null | tr -d '[:space:]' || true)"
-            case "$value" in
-                0)
-                    shopt -u nullglob
-                    printf 'disabled\n'
-                    return 0
-                    ;;
-                1)
-                    shopt -u nullglob
-                    printf 'enabled\n'
-                    return 0
-                    ;;
-            esac
-        done
-        shopt -u nullglob
-    fi
-
-    if command -v mokutil >/dev/null 2>&1; then
-        output="$(mokutil --sb-state 2>/dev/null || true)"
-        if grep -qi 'enabled' <<<"$output"; then
-            printf 'enabled\n'
-            return 0
-        fi
-        if grep -qi 'disabled' <<<"$output"; then
-            printf 'disabled\n'
-            return 0
-        fi
-    fi
-    printf 'unknown\n'
-}
-
-# Guided and interactive workflows
-
-doctor() {
-    local fix="${1:-}" kernel_support="unknown" secure_boot probe_ready=0
-    section "System check"
-
-    if machine_supported; then
-        success "Machine: supported ($MACHINE_PRODUCT / $MACHINE_BOARD / $MACHINE_BIOS)"
-    elif machine_readable; then
-        warn "Machine: UNVALIDATED / OPT-IN REQUIRED ($MACHINE_PRODUCT / $MACHINE_BOARD / $MACHINE_BIOS)"
-    else
-        warn "Machine: DMI UNAVAILABLE / BLOCKED"
-    fi
-
-    if ! print_missing_dependencies full; then
-        if [[ "$fix" == "--fix" ]]; then
-            require_transform_machine
-            install_dependencies full
-        fi
-    fi
-
-    if [[ -r /proc/config.gz ]] && zgrep -q '^CONFIG_ACPI_TABLE_UPGRADE=y$' /proc/config.gz 2>/dev/null; then
-        kernel_support="enabled"
-    elif [[ -r "/boot/config-$(uname -r)" ]] \
-        && grep -q '^CONFIG_ACPI_TABLE_UPGRADE=y$' "/boot/config-$(uname -r)" 2>/dev/null; then
-        kernel_support="enabled"
-    fi
-    printf 'Kernel ACPI table upgrade: %s\n' "$kernel_support"
-
-    collect_missing_dependencies probe
-    if ((${#MISSING_PACKAGES[@]} == 0)); then
-        probe_ready=1
-    fi
-    if (( probe_ready )); then
-        probe_boot
-        refine_installation_formats_cached
-        printf 'Current boot: %s\n' "$(boot_state_label)"
-        printf 'Active DSDT: %s (%s)\n' "$PROBE_REVISION" "$PROBE_REASON"
-        printf 'ACPI taint signal: %s\n' "$PROBE_TAINT"
-        printf 'Boot-log override signal: %s\n' "$PROBE_LOG_OVERRIDE"
-    else
-        printf 'Current boot: not checked (probe dependencies are missing)\n'
-    fi
-
-    printf 'S5 entry format: %s\n' "$PROBE_S5_FORMAT"
-    printf 'Combined entry format: %s\n' "$PROBE_COMBINED_FORMAT"
-
-    secure_boot="$(secure_boot_state)"
-    printf 'Secure Boot: %s\n' "$secure_boot"
-}
-
-choose_setup_variant() {
-    local choice recommendation='Recommended — confirmed shutdown correction'
-    local prompt='Choose an option [1 — S5-only]: '
-    if (( PLAIN_MODE )); then
-        recommendation='Recommended - confirmed shutdown correction'
-        prompt='Choose an option [1 - S5-only]: '
-    fi
-    SETUP_VARIANT_RESULT=''
-    while true; do
-        printf '\nChoose the experimental setup:\n\n'
-        printf '  1. S5-only\n     %s\n\n' "$recommendation"
-        printf '  2. Combined\n     S5 correction plus the separate WQBZ bounds patch\n\n'
-        printf '  3. Both\n     Create two independent experimental Limine entries\n\n'
-        printf '  b. Back\n\n'
-        if ! read -r -p "$prompt" choice; then
-            printf '\n'
-            return 1
-        fi
-        case "${choice:-1}" in
-            1) SETUP_VARIANT_RESULT='s5'; return 0 ;;
-            2) SETUP_VARIANT_RESULT='combined'; return 0 ;;
-            3) SETUP_VARIANT_RESULT='both'; return 0 ;;
-            b|B) return 1 ;;
-            *) warn "Invalid selection. Choose 1, 2, 3 or b." ;;
-        esac
-    done
-}
-
-setup_variant_label() {
-    case "$1" in
-        s5) printf 'S5-only' ;;
-        combined) printf 'Combined' ;;
-        both) printf 'Both' ;;
-        *) return 1 ;;
-    esac
-}
-
-offer_test_reboot() {
-    local requested="$1"
-    section "Ready to test"
-    printf 'The normal CachyOS entry was preserved. At the next Limine menu choose:\n'
-    case "$requested" in
-        s5) printf '  %b%s%b (standard) or %b%s%b (LTS)\n' \
-            "$GREEN$BOLD" "$S5_ENTRY" "$RESET" "$GREEN$BOLD" "$S5_LTS_ENTRY" "$RESET" ;;
-        combined) printf '  %b%s%b (standard) or %b%s%b (LTS)\n' \
-            "$GREEN$BOLD" "$COMBINED_ENTRY" "$RESET" "$GREEN$BOLD" "$COMBINED_LTS_ENTRY" "$RESET" ;;
-        both|all)
-            printf '  %b%s%b / %b%s%b\n' "$GREEN$BOLD" "$S5_ENTRY" "$RESET" "$GREEN$BOLD" "$S5_LTS_ENTRY" "$RESET"
-            printf '  %b%s%b / %b%s%b\n' "$GREEN$BOLD" "$COMBINED_ENTRY" "$RESET" "$GREEN$BOLD" "$COMBINED_LTS_ENTRY" "$RESET"
-            ;;
-    esac
-    printf '\nDo not make an experimental entry the default until it has been tested repeatedly.\n'
-    if confirm_dangerous "Reboot now?" no; then
-        ensure_admin
-        "$SUDO_BIN" "$SYSTEMCTL_BIN" reboot \
-            || die "systemd could not start the reboot."
-    fi
-}
-
-guided_setup() {
-    local requested="${1:-}" source_archive variant s5_archive combined_archive
-    local schema
-
-    section "Guided setup"
-    printf 'This workflow compiles and installs a machine-specific ACPI table override.\n'
-    printf 'It never flashes the BIOS and never replaces the normal CachyOS entry.\n'
-    require_transform_machine
-    if [[ -z "$requested" ]]; then
-        choose_setup_variant || return 0
-        requested="$SETUP_VARIANT_RESULT"
-    else
-        case "$requested" in
-            s5|combined|both) ;;
-            *) die "Variant must be s5, combined or both." ;;
-        esac
-    fi
-    local requested_label
-    requested_label="$(setup_variant_label "$requested")"
-    printf '\nSelected setup: %s\n' "$requested_label"
-    confirm "Continue with the $requested_label experimental setup?" no || return 0
-    require_stock_boot setup "$requested" || return 4
-    ensure_dependencies setup
-
-    if [[ "$requested" == "s5" || "$requested" == "both" ]]; then
-        schema="$(inspect_variant_schema s5)"
-        [[ "$schema" != "conflict" ]] \
-            || die "S5-only contains modified or ambiguous state; guided setup is blocked."
-        [[ "$schema" == "absent" || "$schema" == "managed" ]] \
-            || die "S5-only cannot be reconciled automatically from its current format."
-    fi
-    if [[ "$requested" == "combined" || "$requested" == "both" ]]; then
-        schema="$(inspect_variant_schema combined)"
-        [[ "$schema" != "conflict" ]] \
-            || die "Combined contains modified or ambiguous state; guided setup is blocked."
-        [[ "$schema" == "absent" || "$schema" == "managed" ]] \
-            || die "Combined cannot be reconciled automatically from its current format."
-    fi
-
-    source_archive="$(latest_source 2>/dev/null || true)"
-    if [[ -n "$source_archive" ]]; then
-        printf '\nExisting private source archive:\n  %s\n' "$source_archive"
-        if ! confirm "Reuse this verified source?" yes; then
-            source_archive=''
-        fi
-    fi
-    if [[ -z "$source_archive" ]]; then
-        capture_source setup "$requested" || return
-        source_archive="$LAST_SOURCE_ARCHIVE"
-    fi
-
-    case "$requested" in
-        s5|combined)
-            variant="$requested"
-            build_one "$variant" "$source_archive" || return
-            install_one "$variant" "$LAST_BUILD_ARCHIVE" || return
-            ;;
-        both)
-            build_one s5 "$source_archive" || return
-            s5_archive="$LAST_BUILD_ARCHIVE"
-            build_one combined "$source_archive" || return
-            combined_archive="$LAST_BUILD_ARCHIVE"
-            install_one s5 "$s5_archive" || return
-            install_one combined "$combined_archive" || return
-            ;;
-    esac
-
-    clear_pending_action
-    success "Guided setup completed."
-    offer_test_reboot "$requested"
-}
-
-resume_pending_workflow() {
-    local action variant description
-    action="$(pending_action)" || die "No valid pending workflow is available."
-    variant="$(pending_variant 2>/dev/null || true)"
-    description="$(pending_description)"
-
-    if pending_is_same_boot; then
-        reboot_stock "$action" "$variant"
-        return
-    fi
-
-    section "Resume pending workflow"
-    printf 'Continuing: %s\n' "$description"
-    case "$action" in
-        setup)
-            guided_setup "$variant" || return
-            ;;
-        collect)
-            capture_source || return
-            ;;
-        build)
-            build_variants "$variant" || return
-            ;;
-        install)
-            install_variants "$variant" || return
-            ;;
-        *)
-            die "Unsupported pending action: $action"
-            ;;
-    esac
-    clear_pending_action
-}
-
-pending_workflow_action() {
-    local action variant
-    if action="$(pending_action 2>/dev/null)"; then
-        variant="$(pending_variant 2>/dev/null || true)"
-        if pending_is_same_boot; then
-            reboot_stock "$action" "$variant"
-        else
-            resume_pending_workflow
-        fi
-    else
-        warn "No pending workflow is available."
-    fi
-}
-
-dashboard_line() {
-    local label="$1" value="$2" status="$3" status_color="$4"
-    label="${label:0:14}"
-    value="${value:0:22}"
-    status="${status:0:29}"
-    printf '%s  %-14s %-22s %b%-29s%b     %s\n' \
-        "$BANNER_VERTICAL" "$label" "$value" "$status_color$BOLD" "$status" "$RESET" "$BANNER_VERTICAL"
-}
-
-show_banner() {
-    local top bottom width=76 title product_text dependency_text dependency_status boot_label pending=''
-    local pending_status
-    local border_left border_right bottom_left bottom_right vertical horizontal
-
-    if (( UNICODE_ENABLED )); then
-        border_left='╭'
-        border_right='╮'
-        bottom_left='╰'
-        bottom_right='╯'
-        vertical='│'
-        horizontal='─'
-    else
-        border_left='+'
-        border_right='+'
-        bottom_left='+'
-        bottom_right='+'
-        vertical='|'
-        horizontal='-'
-    fi
-    BANNER_VERTICAL="$vertical"
-    printf -v top '%*s' "$((width - 2))" ''
-    top="${top// /$horizontal}"
-    bottom="$top"
-    title=" $APP_NAME v$VERSION "
-
-    printf '\n%b%s%s%s%b\n' "$ORANGE" "$border_left" "$title" "${top:${#title}}$border_right" "$RESET"
-    printf '%b' "$ORANGE"
-    printf '%s%*s%s\n' "$vertical" "$((width - 2))" '' "$vertical"
-    printf '%b' "$RESET"
-
-    if machine_supported; then
-        product_text="8E35 / BIOS F.13"
-        dashboard_line "Machine" "$product_text" "READY" "$GREEN"
-    elif machine_readable; then
-        product_text="${MACHINE_BOARD} / ${MACHINE_BIOS}"
-        dashboard_line "Machine" "$product_text" "UNVALIDATED / OPT-IN REQUIRED" "$YELLOW"
-    else
-        product_text="${MACHINE_BOARD:-unknown} / ${MACHINE_BIOS:-unknown}"
-        dashboard_line "Machine" "$product_text" "DMI UNAVAILABLE / BLOCKED" "$RED"
-    fi
-
-    collect_missing_dependencies
-    if ((${#MISSING_PACKAGES[@]} == 0)); then
-        dependency_text="All commands available"
-        dependency_status="READY"
-        dashboard_line "Dependencies" "$dependency_text" "$dependency_status" "$GREEN"
-    else
-        dependency_text="${#MISSING_PACKAGES[@]} package(s) missing"
-        dependency_status="ACTION"
-        dashboard_line "Dependencies" "$dependency_text" "$dependency_status" "$YELLOW"
-    fi
-
-    if machine_supported || (( UNVALIDATED_CONSENT )); then
-        probe_boot_if_cached >/dev/null 2>&1 || true
-        refine_installation_formats_cached
-        STOCK_RECOVERY_STATUS_LABEL="$(stock_recovery_snapshot_status "$(stock_recovery_status)")"
-        STOCK_RECOVERY_STATUS_LABEL="${STOCK_RECOVERY_STATUS_LABEL^^}"
-    fi
-    boot_label="$(boot_state_label)"
-    dashboard_line "Current boot" "$PROBE_REVISION" "$boot_label" "$(boot_state_color)"
-    dashboard_line "Stock recovery" "Preventive snapshot" "$STOCK_RECOVERY_STATUS_LABEL" \
-        "$([[ "$STOCK_RECOVERY_STATUS_LABEL" == "VALID" ]] && printf '%s' "$GREEN" || printf '%s' "$YELLOW")"
-
-    dashboard_line "S5-only" "Limine test entry" \
-        "$(variant_dashboard_status s5)" \
-        "$(variant_dashboard_color s5)"
-    dashboard_line "Combined" "S5 + WQBZ entry" \
-        "$(variant_dashboard_status combined)" \
-        "$(variant_dashboard_color combined)"
-
-    if pending="$(pending_description 2>/dev/null)"; then
-        if pending_is_same_boot; then
-            pending_status="REBOOT REQUIRED"
-        else
-            pending_status="RESUME"
-        fi
-        dashboard_line "Pending" "$pending" "$pending_status" "$YELLOW"
-    fi
-
-    printf '%b' "$ORANGE"
-    printf '%s%*s%s\n' "$vertical" "$((width - 2))" '' "$vertical"
-    printf '%s%s%s\n' "$bottom_left" "$bottom" "$bottom_right"
-    printf '%b' "$RESET"
-}
-
-recommended_action() {
-    local pending=''
-    if ! machine_readable; then
-        printf 'DMI identity is unavailable; transformation workflows are blocked.'
-    elif ! machine_supported; then
-        printf 'Transformations require explicit unvalidated-machine opt-in.'
-    elif pending="$(pending_description 2>/dev/null)"; then
-        if pending_is_same_boot; then
-            printf 'Reboot into the normal Limine entry to continue %s.' "$pending"
-        else
-            printf 'Resume the pending %s workflow.' "$pending"
-        fi
-    elif ((${#MISSING_PACKAGES[@]} > 0)); then
-        printf 'Install the missing dependencies.'
-    elif [[ "$PROBE_S5_FORMAT" == "conflict" || "$PROBE_COMBINED_FORMAT" == "conflict" ]]; then
-        printf 'Run status; modified or ambiguous installation state is blocked.'
-    elif [[ "$PROBE_S5_FORMAT" == "legacy" || "$PROBE_COMBINED_FORMAT" == "legacy" ]]; then
-        if [[ "$PROBE_STATE" == "s5" || "$PROBE_STATE" == "combined" ]]; then
-            printf 'Reboot into the normal Limine entry, then remove and freshly reinstall the legacy entry.'
-        else
-            printf 'Remove each legacy entry, then create a fresh managed entry.'
-        fi
-    elif [[ "$PROBE_STATE" == "s5" || "$PROBE_STATE" == "combined" ]]; then
-        printf 'Reboot into the normal Limine entry before changing an experimental entry.'
-    elif [[ "$PROBE_STATE" == "stock" && "$STOCK_RECOVERY_STATUS_LABEL" != "VALID" ]]; then
-        printf 'Prepare the preventive stock-recovery snapshot before installing a variant.'
-    elif [[ "$PROBE_S5_FORMAT" == "managed" || "$PROBE_COMBINED_FORMAT" == "managed" ]]; then
-        printf 'Managed entries are installed; run status after kernel or initramfs updates.'
-    elif [[ "$PROBE_STATE" == "unknown" || "$PROBE_STATE" == "unavailable" ]]; then
-        printf 'Run diagnostics and reboot into the normal Limine entry.'
-    else
-        printf 'Start the guided setup.'
-    fi
-}
-
-manage_menu() {
-    local choice
-    while true; do
-        section "Manage Limine entries"
-        printf '  1. Status for both variants\n'
-        printf '  2. Install S5-only\n'
-        printf '  3. Install Combined\n'
-        printf '  4. Install both variants\n'
-        printf '  5. Remove S5-only\n'
-        printf '  6. Remove Combined\n'
-        printf '  7. Remove both variants\n'
-        printf '  b. Back\n\n'
-        read -r -p 'Selection: ' choice
-        case "$choice" in
-            1) ( status_variants all ) || true; pause_for_user ;;
-            2) ( install_variants s5 ) || true; pause_for_user ;;
-            3) ( install_variants combined ) || true; pause_for_user ;;
-            4) ( install_variants both ) || true; pause_for_user ;;
-            5) ( remove_variants s5 ) || true; pause_for_user ;;
-            6) ( remove_variants combined ) || true; pause_for_user ;;
-            7) ( remove_variants all ) || true; pause_for_user ;;
-            b|B) return 0 ;;
-            *) warn "Invalid selection." ;;
-        esac
-    done
-}
-
-advanced_menu() {
-    local choice
-    while true; do
-        section "Advanced tools"
-        printf '  1. Collect a fresh stock ACPI source\n'
-        printf '  2. Build S5-only without installing\n'
-        printf '  3. Build Combined without installing\n'
-        printf '  4. Show private artifacts\n'
-        printf '  5. Show last operation log\n'
-        printf '  b. Back\n\n'
-        read -r -p 'Selection: ' choice
-        case "$choice" in
-            1) ( capture_source ) || true; pause_for_user ;;
-            2) ( build_variants s5 ) || true; pause_for_user ;;
-            3) ( build_variants combined ) || true; pause_for_user ;;
-            4) ( show_artifacts ) || true; pause_for_user ;;
-            5) ( show_last_log ) || true; pause_for_user ;;
-            b|B) return 0 ;;
-            *) warn "Invalid selection." ;;
-        esac
-    done
-}
-
-uninstall_toolkit() {
-    [[ -x "$UNINSTALLER" ]] || die "Uninstaller not found."
-    if variant_installed s5 || variant_installed combined; then
-        die "Remove both managed Limine entries before uninstalling the toolkit."
-    fi
-    warn "This removes the installed command and program files. Private artifacts are preserved."
-    confirm_dangerous "Uninstall $APP_NAME?" no || return 0
-    ensure_admin
-    "$SUDO_BIN" -- "$UNINSTALLER"
-}
-
-draw_home_dashboard() {
-    if [[ -t 1 && "${TERM:-dumb}" != "dumb" && "$PLAIN_MODE" == "0" ]]; then
-        printf '\033[2J\033[H'
-    fi
-    show_banner
-    printf '\n%bRecommended next step:%b %s\n' \
-        "$YELLOW$BOLD" "$RESET" "$(recommended_action)"
-}
-
-interactive_main() {
-    local choice prompt pending_text
-    [[ -t 0 && -t 1 ]] || {
-        usage
-        return 2
-    }
-
-    draw_home_dashboard
-
-    if machine_supported && [[ "${OMEN_ACPI_TESTING:-0}" != "1" ]]; then
-        collect_missing_dependencies full
-        if ((${#MISSING_PACKAGES[@]} > 0)) \
-            && confirm "Install required dependencies now?" yes; then
-            install_dependencies full
-            draw_home_dashboard
-        fi
-        collect_missing_dependencies probe
-        if ((${#MISSING_PACKAGES[@]} == 0)) \
-            && [[ "$PROBE_STATE" == "not-checked" ]] \
-            && confirm "Check the active ACPI boot state now?" yes; then
-            probe_boot
-            draw_home_dashboard
-        fi
-    fi
-
-    while true; do
-        prompt='omen-acpi > '
-        (( UNICODE_ENABLED )) && prompt='omen-acpi › '
-        printf '\n%bWhat would you like to do?%b\n\n' "$BOLD" "$RESET"
-        printf '  %b1.%b Guided setup\n' "$CYAN" "$RESET"
-        printf '  %b2.%b Status and diagnostics\n' "$CYAN" "$RESET"
-        printf '  %b3.%b Manage Limine entries\n' "$CYAN" "$RESET"
-        printf '  %b4.%b Dependencies\n' "$CYAN" "$RESET"
-        printf '  %b5.%b Advanced tools\n' "$CYAN" "$RESET"
-        printf '  %br.%b Stock boot and recovery\n' "$CYAN" "$RESET"
-        if pending_text="$(pending_description 2>/dev/null)"; then
-            if pending_is_same_boot; then
-                printf '  %bp.%b Reboot into stock to continue pending %s\n' "$CYAN" "$RESET" "$pending_text"
-            else
-                printf '  %bp.%b Resume pending %s\n' "$CYAN" "$RESET" "$pending_text"
-            fi
-        fi
-        printf '  %bu.%b Uninstall toolkit\n' "$CYAN" "$RESET"
-        printf '  %bq.%b Quit\n\n' "$CYAN" "$RESET"
-        read -r -p "$prompt" choice
-        case "$choice" in
-            1) ( guided_setup ) || true; pause_for_user; draw_home_dashboard ;;
-            2) ( doctor; printf '\n'; status_variants all ) || true; pause_for_user; draw_home_dashboard ;;
-            3) manage_menu; draw_home_dashboard ;;
-            4) ( require_transform_machine; install_dependencies full ) || true; pause_for_user; draw_home_dashboard ;;
-            5) advanced_menu; draw_home_dashboard ;;
-            r|R) stock_recovery_menu; draw_home_dashboard ;;
-            p|P) ( pending_workflow_action ) || true; pause_for_user; draw_home_dashboard ;;
-            u|U) ( uninstall_toolkit ) && return 0; pause_for_user; draw_home_dashboard ;;
-            q|Q|'') return 0 ;;
-            *) warn "Invalid selection." ;;
-        esac
-    done
-}
-
-# Command-line entry point
 
 usage() {
     cat <<EOF
-$APP_NAME v$VERSION
+Usage: omen-acpi {install|repair|status|remove} [--title NAME]
 
-Usage:
-  omen-acpi                         Open the interactive dashboard
-  omen-acpi setup [s5|combined|both]
-  omen-acpi doctor [--fix]
-  omen-acpi dependencies [--install]
-  omen-acpi collect
-  omen-acpi build <s5|combined|both> [SOURCE_ARCHIVE]
-  omen-acpi install <s5|combined|both> [BUILD_ARCHIVE]
-  omen-acpi refresh [s5|combined|all]
-  omen-acpi status [s5|combined|all]
-  omen-acpi remove <s5|combined|all>
-  omen-acpi artifacts
-  omen-acpi logs
-  omen-acpi resume
-  omen-acpi prepare-stock-recovery
-  omen-acpi recover-stock
-  omen-acpi reboot-stock
-  omen-acpi remove-stock-recovery
-  omen-acpi uninstall
-  omen-acpi version
+Debian-based rEFInd installer for the S5 DSDT override.
 
-Global options:
-  --no-color, --plain    Disable ANSI colour; --plain also disables Unicode
-  --yes                  Accept routine confirmations; never auto-confirms a
-                         reboot, removal, uninstall or full system update
-  -h, --help             Show this help
+  install   Collect this machine's DSDT, build the s5 variant, and append one
+            manual rEFInd stanza. Does not edit refind_linux.conf.
+            Then asks whether to run the DSDT revision check at each
+            graphical login.
+  repair    Keep the existing override and rebuild the initrd copy after a
+            driver update. Also rewrites the owned stanza.
+  status    Show whether the stanza, the early CPIO, and the login check
+            are present.
+  remove    Delete the marked stanza, /boot/omen-acpi/s5-*, and the login
+            check, if one was enabled.
 
-Global options may appear before or after the command.
-The normal CachyOS Limine entry is never replaced or made non-default.
-In the dashboard, r always opens Stock boot and recovery; p handles a pending workflow.
+  --title NAME   Menu entry name. Default: ${DEFAULT_TITLE}
+                 install and repair only. repair keeps the installed name
+                 unless --title is passed.
+
+Stock return is the normal auto-detected Linux icon. rEFInd may remember the
+last selection, so pick that icon again after a test boot. This command does
+not change default_selection, the menu timeout, scan options, or NVRAM.
 EOF
 }
 
-main() {
-    local -a arguments=()
-    local argument command help_requested=0
+validate_menu_title() {
+    python3 - "$STANZA_PY" "$MENU_TITLE" <<'PY'
+import importlib.util
+import sys
 
-    while (($# > 0)); do
-        argument="$1"
-        case "$argument" in
-            --no-color)
-                COLOR_ENABLED=0
-                set_palette
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.validate_title(sys.argv[2])
+except module.StanzaError as exc:
+    raise SystemExit(str(exc))
+PY
+}
+
+parse_title_args() {
+    MENU_TITLE="$DEFAULT_TITLE"
+    TITLE_FROM_USER=0
+    while (($#)); do
+        case "$1" in
+            --title)
+                shift
+                (($#)) || die "--title requires a menu name"
+                MENU_TITLE="$1"
+                TITLE_FROM_USER=1
                 ;;
-            --plain)
-                COLOR_ENABLED=0
-                UNICODE_ENABLED=0
-                PLAIN_MODE=1
-                set_palette
-                ;;
-            --yes)
-                ASSUME_YES=1
-                ;;
-            -h|--help)
-                help_requested=1
+            --title=*)
+                MENU_TITLE="${1#--title=}"
+                TITLE_FROM_USER=1
                 ;;
             *)
-                arguments+=("$argument")
+                die "Unknown argument: $1"
                 ;;
         esac
         shift
     done
-    set -- "${arguments[@]}"
+    validate_menu_title
+}
 
-    if (( help_requested )); then
-        usage
-        return 0
+check_debian_family() {
+    # Pop!_OS, Debian, and Ubuntu ship /etc/os-release as a symlink.
+    # -f follows it and stays false when the target is missing or not a file.
+    [[ -f /etc/os-release && -r /etc/os-release ]] \
+        || die "Cannot read /etc/os-release"
+    python3 - "$STANZA_PY" /etc/os-release <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+text = open(sys.argv[2], encoding="utf-8").read()
+if not module.debian_family(text):
+    raise SystemExit(
+        "This command only runs on a Debian-based system "
+        "(os-release ID or ID_LIKE must include debian or ubuntu)"
+    )
+PY
+}
+
+title_from_manifest() {
+    local line
+    [[ -f "$MANIFEST" && ! -L "$MANIFEST" && -r "$MANIFEST" ]] \
+        || die "Manifest is missing; pass --title or run install"
+    line="$(grep -m1 '^TITLE=' -- "$MANIFEST" || true)"
+    [[ -n "$line" ]] || die "Manifest has no TITLE= line; pass --title"
+    MENU_TITLE="${line#TITLE=}"
+    validate_menu_title
+}
+
+read_text() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" && -r "$path" ]] || die "Unreadable file: $path"
+    tr -d '\r' < "$path"
+}
+
+dmi_value() {
+    local path="$1" value
+    [[ -r "$path" && ! -L "$path" ]] || die "DMI value is unreadable: $path"
+    value="$(tr -d '\r\n' < "$path")"
+    [[ -n "$value" && "$value" != *$'\n'* ]] || die "DMI value is empty: $path"
+    printf '%s\n' "$value"
+}
+
+check_identity() {
+    local product board bios
+    product="$(dmi_value /sys/class/dmi/id/product_name)"
+    board="$(dmi_value /sys/class/dmi/id/board_name)"
+    bios="$(dmi_value /sys/class/dmi/id/bios_version)"
+    [[ "$product" == "$EXPECTED_PRODUCT" \
+        && "$board" == "$EXPECTED_BOARD" \
+        && "$bios" == "$EXPECTED_BIOS" ]] \
+        || die "This companion only runs on ${EXPECTED_PRODUCT}, board ${EXPECTED_BOARD}, BIOS ${EXPECTED_BIOS} (found ${product} / ${board} / ${bios})"
+}
+
+check_gpu() {
+    local vendor="/sys/bus/pci/devices/${EXPECTED_NVIDIA_BDF}/vendor"
+    [[ -r "$vendor" ]] || die "NVIDIA GPU is not visible at ${EXPECTED_NVIDIA_BDF}"
+    [[ "$(tr -d '[:space:]' < "$vendor")" == "0x10de" ]] \
+        || die "Unexpected PCI vendor at ${EXPECTED_NVIDIA_BDF}"
+}
+
+check_table_upgrade() {
+    local config="/boot/config-$(uname -r)"
+    if [[ -r /proc/config.gz ]]; then
+        need_cmd gzip
+        gzip -dc /proc/config.gz | grep -qx 'CONFIG_ACPI_TABLE_UPGRADE=y' \
+            || die "Running kernel does not have CONFIG_ACPI_TABLE_UPGRADE=y"
+        return
     fi
+    [[ -r "$config" ]] || die "Cannot read kernel config to prove CONFIG_ACPI_TABLE_UPGRADE=y"
+    grep -qx 'CONFIG_ACPI_TABLE_UPGRADE=y' "$config" \
+        || die "Running kernel does not have CONFIG_ACPI_TABLE_UPGRADE=y"
+}
 
-    command="${1:-}"
-    [[ -z "$command" ]] || shift
-    case "$command" in
-        '') interactive_main ;;
-        setup)
-            (($# <= 1)) || die "Usage: omen-acpi setup [s5|combined|both]"
-            case "${1:-}" in
-                ''|s5|combined|both) ;;
-                *) die "Usage: omen-acpi setup [s5|combined|both]" ;;
-            esac
-            guided_setup "${1:-}"
-            ;;
-        doctor)
-            if (($# > 1)) || { (($# == 1)) && [[ "$1" != "--fix" ]]; }; then
-                die "Usage: omen-acpi doctor [--fix]"
-            fi
-            doctor "${1:-}"
-            ;;
-        dependencies)
-            if (($# > 1)) || { (($# == 1)) && [[ "$1" != "--install" ]]; }; then
-                die "Usage: omen-acpi dependencies [--install]"
-            fi
-            if [[ "${1:-}" == "--install" ]]; then
-                require_transform_machine
-                install_dependencies full
-            else
-                print_missing_dependencies full
-            fi
-            ;;
-        collect) (($# == 0)) || die "Usage: omen-acpi collect"; capture_source ;;
-        build)
-            (($# == 1 || $# == 2)) || die "Usage: omen-acpi build <s5|combined|both> [SOURCE_ARCHIVE]"
-            case "$1" in s5|combined|both) ;; *) die "Usage: omen-acpi build <s5|combined|both> [SOURCE_ARCHIVE]" ;; esac
-            build_variants "$1" "${2:-}"
-            ;;
-        install)
-            (($# == 1 || $# == 2)) || die "Usage: omen-acpi install <s5|combined|both> [BUILD_ARCHIVE]"
-            case "$1" in s5|combined|both) ;; *) die "Usage: omen-acpi install <s5|combined|both> [BUILD_ARCHIVE]" ;; esac
-            install_variants "$1" "${2:-}"
-            ;;
-        refresh)
-            (($# <= 1)) || die "Usage: omen-acpi refresh [s5|combined|all]"
-            case "${1:-all}" in s5|combined|all) ;; *) die "Usage: omen-acpi refresh [s5|combined|all]" ;; esac
-            refresh_variants "${1:-all}"
-            ;;
-        migrate|restore-legacy)
-            die "This command was removed."
-            ;;
-        status)
-            (($# <= 1)) || die "Usage: omen-acpi status [s5|combined|all]"
-            case "${1:-all}" in s5|combined|all) ;; *) die "Usage: omen-acpi status [s5|combined|all]" ;; esac
-            status_variants "${1:-all}"
-            ;;
-        remove)
-            (($# == 1)) || die "Usage: omen-acpi remove <s5|combined|all>"
-            case "$1" in s5|combined|all) ;; *) die "Usage: omen-acpi remove <s5|combined|all>" ;; esac
-            remove_variants "$1"
-            ;;
-        artifacts) (($# == 0)) || die "Usage: omen-acpi artifacts"; show_artifacts ;;
-        logs) (($# == 0)) || die "Usage: omen-acpi logs"; show_last_log ;;
-        resume) (($# == 0)) || die "Usage: omen-acpi resume"; resume_pending_workflow ;;
-        reboot-stock)
-            (($# == 0)) || die "Usage: omen-acpi reboot-stock"
-            probe_boot
-            reboot_stock
-            ;;
-        prepare-stock-recovery)
-            (($# == 0)) || die "Usage: omen-acpi prepare-stock-recovery"
-            prepare_stock_recovery
-            ;;
-        recover-stock)
-            (($# == 0)) || die "Usage: omen-acpi recover-stock"
-            recover_stock
-            ;;
-        remove-stock-recovery)
-            (($# == 0)) || die "Usage: omen-acpi remove-stock-recovery"
-            remove_stock_recovery
-            ;;
-        uninstall) (($# == 0)) || die "Usage: omen-acpi uninstall"; uninstall_toolkit ;;
-        version|--version|-V)
-            (($# == 0)) || die "Usage: omen-acpi version"
-            printf '%s %s\n' "$APP_NAME" "$VERSION"
-            ;;
-        help)
-            (($# == 0)) || die "Usage: omen-acpi help"
-            usage
-            ;;
-        *) usage >&2; die "Unknown command: $command" ;;
+check_secure_boot() {
+    local state
+    need_cmd mokutil
+    state="$(mokutil --sb-state 2>/dev/null || true)"
+    [[ "$state" == *"SecureBoot disabled"* ]] \
+        || die "Secure Boot must be disabled; the override initrd is not signed"
+}
+
+kernel_version() {
+    local version
+    version="$(uname -r)"
+    [[ "$version" =~ ^[0-9A-Za-z._+-]+$ ]] || die "Refusing unusual kernel version: ${version}"
+    printf '%s\n' "$version"
+}
+
+partuuid_of() {
+    local source="$1" name uevent value
+    name="$(basename -- "$source")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Unexpected block device name: ${source}"
+    uevent="/sys/class/block/${name}/uevent"
+    [[ -r "$uevent" ]] || die "Cannot read PARTUUID for ${source}"
+    value="$(awk -F= '$1 == "PARTUUID" { print $2 }' "$uevent")"
+    [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+        || die "PARTUUID missing or invalid for ${source}"
+    printf '%s\n' "$value"
+}
+
+volume_layout() {
+    local version="${1-}" kernel_file initrd_file mount source partuuid
+    local loader stock_rel early_rel cmdline_initrd
+    version="${version:-$(kernel_version)}"
+    kernel_file="/boot/vmlinuz-${version}"
+    initrd_file="/boot/initrd.img-${version}"
+    [[ -f "$kernel_file" && ! -L "$kernel_file" ]] || die "Kernel is missing or is a symlink: ${kernel_file}"
+    [[ -f "$initrd_file" && ! -L "$initrd_file" ]] || die "Initrd is missing or is a symlink: ${initrd_file}"
+
+    mount="$(findmnt -no TARGET -T "$kernel_file")"
+    source="$(findmnt -no SOURCE -T "$kernel_file")"
+    [[ -n "$mount" && -n "$source" && "$source" != *"["* ]] \
+        || die "Cannot identify the filesystem that contains ${kernel_file}"
+    [[ "$(findmnt -no SOURCE -T "$initrd_file")" == "$source" ]] \
+        || die "Kernel and initrd are not on the same volume"
+    [[ "$(findmnt -no SOURCE -T /boot)" == "$source" ]] \
+        || die "/boot is not on the same volume as the kernel"
+
+    partuuid="$(partuuid_of "$source")"
+    loader="/$(realpath --relative-to="$mount" "$kernel_file")"
+    stock_rel="$(realpath --relative-to="$mount" "$initrd_file")"
+    early_rel="$(realpath --relative-to="$mount" "$EARLY_CPIO" 2>/dev/null || true)"
+    if [[ -z "$early_rel" ]]; then
+        early_rel="$(python3 - "$mount" "$EARLY_CPIO" <<'PY'
+import os
+import sys
+print(os.path.relpath(sys.argv[2], sys.argv[1]))
+PY
+)"
+    fi
+    [[ "$early_rel" != .. && "$early_rel" != ../* ]] \
+        || die "Early CPIO would not live on the kernel volume: ${EARLY_CPIO}"
+
+    cmdline_initrd="$(awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^initrd=/) {
+                print substr($i, 8)
+                count++
+            }
+        }
+        if (count != 1) exit 1
+    }' /proc/cmdline)" || die "Expected exactly one initrd= token on the running command line"
+    [[ "${cmdline_initrd//\\//}" == "$stock_rel" ]] \
+        || die "Running boot initrd (${cmdline_initrd}) is not the stock file this stanza would use (${stock_rel}). Boot the normal rEFInd icon first."
+
+    VOLUME_MOUNT="$mount"
+    VOLUME_PARTUUID="$partuuid"
+    VOLUME_LOADER="$loader"
+    VOLUME_STOCK="/${stock_rel}"
+    VOLUME_EARLY="/${early_rel}"
+    VOLUME_COMBINED="/$(dirname -- "$early_rel")/s5-initrd.img"
+    VOLUME_KERNEL="$version"
+}
+
+linux_options() {
+    [[ -f "$REFIND_LINUX_CONF" && ! -L "$REFIND_LINUX_CONF" ]] \
+        || die "rEFInd linux config is missing or is a symlink: ${REFIND_LINUX_CONF}. This command only supports rEFInd."
+    python3 - "$STANZA_PY" "$REFIND_LINUX_CONF" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.parse_linux_options(open(sys.argv[2], encoding="utf-8").read()))
+PY
+}
+
+write_stanza() {
+    local destination="$1" options="$2"
+    python3 - "$STANZA_PY" "$destination" "$VOLUME_KERNEL" "$VOLUME_PARTUUID" \
+        "$VOLUME_LOADER" "$VOLUME_COMBINED" "$options" "$MENU_TITLE" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+stanza = module.render_stanza(
+    kernel=sys.argv[3],
+    partuuid=sys.argv[4],
+    loader=sys.argv[5],
+    initrd=sys.argv[6],
+    options=sys.argv[7],
+    title=sys.argv[8],
+)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    handle.write(stanza)
+PY
+    chmod 0600 "$destination"
+}
+
+# rEFInd 0.13 keeps one initrd token. The uncompressed ACPI CPIO has to be the
+# first archive in that single file so the kernel scans it before the stock
+# initramfs. Do not modify the stock initrd itself.
+write_combined_initrd() {
+    local early="$1" stock="$2" destination="$3" size
+    [[ -f "$early" && ! -L "$early" ]] || die "Early CPIO is missing or is a symlink: ${early}"
+    [[ -f "$stock" && ! -L "$stock" ]] || die "Stock initrd is missing or is a symlink: ${stock}"
+    [[ "$stock" != "$destination" && "$early" != "$destination" ]] \
+        || die "Refusing to overwrite the stock initrd"
+    size="$(stat -c '%s' -- "$early")"
+    (( size > 0 && size % 4 == 0 )) \
+        || die "Early CPIO is empty or not 4-byte aligned; refusing to concatenate it"
+    python3 - "$early" <<'PY'
+from pathlib import Path
+import sys
+magic = Path(sys.argv[1]).read_bytes()[:6]
+if magic != b"070701":
+    raise SystemExit("Early CPIO is not an uncompressed newc archive")
+PY
+    cat -- "$early" "$stock" > "$destination"
+    chmod 0600 "$destination"
+}
+
+confirm() {
+    local prompt="$1" answer
+    [[ -r /dev/tty && -w /dev/tty ]] || die "Refusing to change boot files without a terminal confirmation"
+    printf '%s [y/N] ' "$prompt" > /dev/tty
+    IFS= read -r answer < /dev/tty || die "Confirmation was not read"
+    case "$answer" in
+        y|yes|Y|YES) ;;
+        *) die "No changes made" ;;
     esac
 }
 
-trap 'printf "\n" >&2' INT
-if [[ "${OMEN_ACPI_SOURCE_ONLY:-0}" != "1" ]]; then
-    main "$@"
+ask_yes_no() {
+    local prompt="$1" answer
+    [[ -r /dev/tty && -w /dev/tty ]] || die "Refusing to continue without a terminal"
+    printf '%s [y/N] ' "$prompt" > /dev/tty
+    IFS= read -r answer < /dev/tty || die "Answer was not read"
+    case "$answer" in
+        y|yes|Y|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+startup_desktop_path() {
+    printf '%s/%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/autostart" "$STARTUP_DESKTOP_NAME"
+}
+
+enable_startup_check() {
+    local script dir desktop temporary
+    (($# == 0)) || die "enable startup check takes no arguments"
+    script="$ROOT/scripts/check-dsdt-revision.sh"
+    [[ -x "$script" && ! -L "$script" ]] || die "DSDT revision check is missing"
+    [[ "$script" =~ ^[A-Za-z0-9._/-]+$ ]] \
+        || die "Check script path cannot be placed in a desktop entry: ${script}"
+    dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+    desktop="$dir/$STARTUP_DESKTOP_NAME"
+    mkdir -p -- "$dir"
+    if [[ -e "$desktop" ]]; then
+        [[ -f "$desktop" && ! -L "$desktop" ]] \
+            || die "Startup entry is not a regular file: ${desktop}"
+    fi
+    temporary="$(mktemp "$dir/.omen-acpi-dsdt-check.XXXXXX")"
+    cat > "$temporary" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OMEN ACPI DSDT revision check
+Comment=Notify when the loaded DSDT OEM revision is not 0107200A
+Exec=${script} --startup
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=8
+X-OMEN-ACPI-Startup-Check=1
+EOF
+    chmod 0644 "$temporary"
+    mv -f -- "$temporary" "$desktop"
+    printf 'Enabled the login check: %s\n' "$desktop"
+}
+
+disable_startup_check() {
+    local desktop
+    (($# == 0)) || die "disable startup check takes no arguments"
+    desktop="$(startup_desktop_path)"
+    if [[ ! -e "$desktop" ]]; then
+        printf 'No login DSDT revision check was installed.\n'
+        return 0
+    fi
+    if [[ -L "$desktop" || ! -f "$desktop" ]]; then
+        printf 'Left %s in place.\n' "$desktop" >&2
+        return 0
+    fi
+    if ! grep -Fq 'X-OMEN-ACPI-Startup-Check=1' "$desktop"; then
+        printf 'Left %s in place because it is not the omen-acpi login check.\n' "$desktop" >&2
+        return 0
+    fi
+    rm -f -- "$desktop"
+    printf 'Removed the login check %s\n' "$desktop"
+}
+
+startup_script_from_desktop() {
+    local line script
+    line="$(grep -m1 '^Exec=' -- "$1" || true)"
+    [[ -n "$line" ]] || return 0
+    script="${line#Exec=}"
+    script="${script%% --startup}"
+    if [[ "$script" == \"*\" ]]; then
+        script="${script#\"}"
+        script="${script%\"}"
+    fi
+    printf '%s\n' "$script"
+}
+
+report_startup_check() {
+    local desktop script
+    (($# == 0)) || die "startup check report takes no arguments"
+    desktop="$(startup_desktop_path)"
+    script=""
+    if [[ -f "$desktop" && ! -L "$desktop" ]] \
+        && grep -Fq 'X-OMEN-ACPI-Startup-Check=1' "$desktop"; then
+        script="$(startup_script_from_desktop "$desktop")"
+    fi
+    if [[ -n "$script" ]]; then
+        printf 'startup_check=enabled %s\n' "$script"
+    else
+        printf 'startup_check=disabled\n'
+    fi
+}
+
+preflight() {
+    local command
+    for command in python3 findmnt awk basename realpath grep tr uname mokutil; do
+        need_cmd "$command"
+    done
+    check_debian_family
+    check_identity
+    check_gpu
+    check_table_upgrade
+    check_secure_boot
+    volume_layout
+    linux_options >/dev/null
+    [[ ! -e "$REFIND_LINUX_CONF" || -f "$REFIND_LINUX_CONF" ]]
+    [[ "$VOLUME_EARLY" == "/boot/omen-acpi/s5-early.cpio" ]] \
+        || die "Kernel volume layout is not /boot on the root filesystem (derived ${VOLUME_EARLY}). A separate /boot partition is not supported."
+    [[ "$VOLUME_COMBINED" == "/boot/omen-acpi/s5-initrd.img" ]] \
+        || die "Derived combined initrd path ${VOLUME_COMBINED} is not /boot/omen-acpi/s5-initrd.img"
+}
+
+artifact_dir() {
+    local root="${XDG_DATA_HOME:-$HOME/.local/share}/omen-acpi-refind"
+    mkdir -p "$root"
+    chmod 0700 "$root"
+    printf '%s\n' "$root"
+}
+
+verify_s5_aml() {
+    python3 - "$1" "$S5_OEM_REVISION" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+expected = int(sys.argv[2], 16)
+if len(data) < 36 or data[:4] != b"DSDT":
+    raise SystemExit("AML is not a DSDT")
+if struct.unpack_from("<I", data, 4)[0] != len(data) or sum(data) & 0xFF:
+    raise SystemExit("AML header length or checksum is invalid")
+if data[10:16] != b"HPQOEM" or data[16:24] != b"8E35    ":
+    raise SystemExit("AML OEM identity is not HPQOEM / 8E35")
+revision = struct.unpack_from("<I", data, 24)[0]
+if revision != expected:
+    raise SystemExit(f"AML OEM revision is 0x{revision:08X}, expected {sys.argv[2]}")
+PY
+}
+
+build_early_cpio() {
+    local aml="$1" destination="$2" early_dir
+    early_dir="$(dirname -- "$destination")/early"
+    rm -rf -- "$early_dir"
+    mkdir -p "$early_dir/kernel/firmware/acpi"
+    install -m 0644 "$aml" "$early_dir/kernel/firmware/acpi/DSDT.aml"
+    (
+        cd "$early_dir"
+        printf '%s\0' \
+            kernel \
+            kernel/firmware \
+            kernel/firmware/acpi \
+            kernel/firmware/acpi/DSDT.aml \
+        | cpio --null --create --format=newc --owner=0:0 --quiet \
+        > "$destination"
+    )
+    chmod 0600 "$destination"
+}
+
+collect_and_build() {
+    local root="$1" source_archive build_archive extracted tool
+    for tool in acpidump acpixtract iasl; do
+        command -v "$tool" >/dev/null 2>&1 \
+            || die "Missing command: ${tool}. Install the acpica-tools package; this companion will not install it."
+    done
+    need_cmd tar
+    need_cmd sha256sum
+    [[ -x "$COLLECT" && -x "$BUILD" ]] || die "Collector or builder is missing"
+    unset OMEN_ACPI_UNVALIDATED_OPT_IN
+    export OMEN_ACPI_OUTPUT_DIR="$root"
+    export OMEN_ACPI_RESULT_FILE="$root/collect-result.txt"
+    "$COLLECT"
+    source_archive="$(tr -d '[:space:]' < "$OMEN_ACPI_RESULT_FILE")"
+    [[ -f "$source_archive" && "$source_archive" == "$root/"* ]] \
+        || die "Collector did not return a private source archive"
+    export OMEN_ACPI_RESULT_FILE="$root/build-result.txt"
+    "$BUILD" s5 "$source_archive"
+    build_archive="$(tr -d '[:space:]' < "$OMEN_ACPI_RESULT_FILE")"
+    [[ -f "$build_archive" && "$build_archive" == "$root/"* ]] \
+        || die "Builder did not return a private s5 archive"
+    extracted="$root/extracted"
+    rm -rf -- "$extracted"
+    mkdir -p "$extracted"
+    tar -xzf "$build_archive" -C "$extracted"
+    mapfile -t aml_files < <(find "$extracted" -type f -name DSDT.aml -print)
+    ((${#aml_files[@]} == 1)) || die "Expected one DSDT.aml in the s5 build archive"
+    verify_s5_aml "${aml_files[0]}"
+    install -m 0600 "${aml_files[0]}" "$root/DSDT.aml"
+}
+
+cmd_install() {
+    local options root tool enable_login_check=0
+    parse_title_args "$@"
+    ((EUID != 0)) || die "Run install as the normal user. It will ask for sudo only to write the boot files."
+    preflight
+    for tool in sudo cpio install sha256sum tar; do
+        need_cmd "$tool"
+    done
+    printf '%s\n' \
+        "This will collect this machine's DSDT and, only if the stock _PTS and WQBZ anchors match, write:" \
+        "  ${EARLY_CPIO}" \
+        "  one marked stanza at the end of ${REFIND_CONF}" \
+        "It will not edit ${REFIND_LINUX_CONF}, default_selection, timeout, scan options, NVRAM, or Windows." \
+        "The NVIDIA 580 driver is not the measured 610 case. If NVDE is not 1, the loaded override can still leave the GPU powered." \
+        "After a test, select the normal rEFInd Linux icon again. rEFInd may remember the last choice." \
+        "It will then ask whether to run the DSDT revision check at each graphical login."
+    confirm "Append the s5 stanza \"${MENU_TITLE}\"?"
+    if ask_yes_no "Run the DSDT revision check at each graphical login?"; then
+        enable_login_check=1
+    fi
+    sudo -- "$0" --internal-preflight "$MENU_TITLE"
+    root="$(artifact_dir)"
+    collect_and_build "$root"
+    options="$(linux_options)"
+    write_stanza "$root/stanza.txt" "$options"
+    sudo -- "$0" --internal-install "$root/DSDT.aml" "$root/stanza.txt" "$MENU_TITLE"
+    printf '\nInstalled. Reboot and select "%s" once.\n' "$MENU_TITLE"
+    printf 'Then select the normal Linux icon. Do not make the test stanza the default.\n'
+    printf 'After that boot, ./scripts/check-dsdt-revision.sh must print matching.\n'
+    if ((enable_login_check)); then
+        enable_startup_check
+    else
+        printf 'The DSDT revision check will not run at login.\n'
+    fi
+}
+
+cmd_repair() {
+    parse_title_args "$@"
+    ((EUID != 0)) || die "Run repair as the normal user. It will ask for sudo only to rewrite the owned boot files."
+    need_cmd sudo
+    if ((TITLE_FROM_USER == 0)); then
+        title_from_manifest
+    fi
+    preflight
+    [[ -f "$EARLY_CPIO" && ! -L "$EARLY_CPIO" ]] \
+        || die "The early CPIO is missing. Run install, not repair."
+    printf '%s\n' \
+        "This keeps the existing DSDT override and rebuilds ${COMBINED_INITRD}" \
+        "in front of a copy of the running kernel's stock initrd." \
+        "It rewrites only the owned stanza, named \"${MENU_TITLE}\"." \
+        "It does not edit ${REFIND_LINUX_CONF}, default_selection, timeout, scan options, or Windows." \
+        "It does not modify ${VOLUME_STOCK}."
+    confirm "Rewrite the s5 stanza \"${MENU_TITLE}\"?"
+    sudo -- "$0" --internal-repair "$MENU_TITLE"
+    printf '\nRepaired. Reboot and select "%s" again.\n' "$MENU_TITLE"
+    printf 'After boot, ./scripts/check-dsdt-revision.sh must print matching.\n'
+}
+
+cmd_status() {
+    (($# == 0)) || die "status takes no arguments"
+    check_debian_family
+    report_startup_check
+    if [[ -r "$REFIND_CONF" ]]; then
+        "$0" --internal-status
+    else
+        need_cmd sudo
+        sudo -- "$0" --internal-status
+    fi
+}
+
+cmd_remove() {
+    (($# == 0)) || die "remove takes no arguments"
+    check_debian_family
+    ((EUID != 0)) || die "Run remove as the normal user. It will ask for sudo only to delete the owned files."
+    need_cmd sudo
+    printf '%s\n' \
+        "This deletes the marked omen-acpi stanza and ${EARLY_CPIO}." \
+        "It also removes the login DSDT revision check, if install enabled one." \
+        "It does not edit ${REFIND_LINUX_CONF}, default_selection, timeout, scan options, or Windows."
+    confirm "Remove the s5 test stanza?"
+    sudo -- "$0" --internal-remove
+    disable_startup_check
+}
+
+internal_preflight() {
+    local title="$1"
+    ((EUID == 0)) || die "internal preflight must run as root"
+    (($# == 1)) || die "internal preflight expects a menu title"
+    MENU_TITLE="$title"
+    validate_menu_title
+    [[ -f "$REFIND_CONF" && ! -L "$REFIND_CONF" ]] \
+        || die "rEFInd config is missing or is a symlink: ${REFIND_CONF}. This command only supports rEFInd."
+    python3 - "$STANZA_PY" "$REFIND_CONF" "$MENU_TITLE" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+text = open(sys.argv[2], encoding="utf-8").read()
+title_line = module.menuentry_line(sys.argv[3])
+if module.BEGIN in text or module.END in text or title_line in text:
+    raise SystemExit("refind.conf already contains an omen-acpi stanza; remove it before installing again")
+PY
+    printf 'rEFInd config is present and has no omen-acpi stanza.\n'
+}
+
+internal_install() {
+    local aml="$1" stanza_file="$2" title="$3" work options
+    ((EUID == 0)) || die "internal install must run as root"
+    (($# == 3)) || die "internal install expects an AML path, a stanza file, and a menu title"
+    MENU_TITLE="$title"
+    validate_menu_title
+    [[ -f "$aml" && ! -L "$aml" && -f "$stanza_file" && ! -L "$stanza_file" ]] \
+        || die "Install payload is missing or is a symlink"
+    preflight
+    need_cmd cpio
+    need_cmd install
+    need_cmd sha256sum
+    verify_s5_aml "$aml"
+    options="$(linux_options)"
+    volume_layout
+    [[ "$VOLUME_EARLY" == "/boot/omen-acpi/s5-early.cpio" ]] \
+        || die "Refusing to install an early CPIO outside /boot/omen-acpi"
+    need_cmd cmp
+
+    work="$(mktemp -d /tmp/omen-acpi-refind.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q' "$work")" RETURN
+    write_stanza "$work/live-stanza.txt" "$options"
+    cmp -s "$work/live-stanza.txt" "$stanza_file" \
+        || die "Stanza file does not match the stanza derived from the live boot files"
+    build_early_cpio "$aml" "$work/s5-early.cpio"
+    if [[ -e "$PAYLOAD_DIR" ]]; then
+        [[ -d "$PAYLOAD_DIR" && ! -L "$PAYLOAD_DIR" ]] || die "Payload path is not a directory: ${PAYLOAD_DIR}"
+    else
+        install -d -o root -g root -m 0755 "$PAYLOAD_DIR"
+    fi
+    if [[ -e "$EARLY_CPIO" || -e "$COMBINED_INITRD" || -e "$MANIFEST" ]]; then
+        die "Payload files already exist. Remove them before installing again: ${PAYLOAD_DIR}"
+    fi
+    write_combined_initrd "$work/s5-early.cpio" "/boot/initrd.img-${VOLUME_KERNEL}" "$work/s5-initrd.img"
+    install -o root -g root -m 0644 "$work/s5-early.cpio" "$EARLY_CPIO"
+    install -o root -g root -m 0644 "$work/s5-initrd.img" "$COMBINED_INITRD"
+    {
+        printf 'VARIANT=s5\n'
+        printf 'TITLE=%s\n' "$MENU_TITLE"
+        printf 'KERNEL=%s\n' "$VOLUME_KERNEL"
+        printf 'PARTUUID=%s\n' "$VOLUME_PARTUUID"
+        printf 'AML_SHA256=%s\n' "$(sha256sum -- "$aml" | awk '{print $1}')"
+        printf 'CPIO_SHA256=%s\n' "$(sha256sum -- "$EARLY_CPIO" | awk '{print $1}')"
+        printf 'COMBINED_SHA256=%s\n' "$(sha256sum -- "$COMBINED_INITRD" | awk '{print $1}')"
+    } > "$work/manifest.txt"
+    install -o root -g root -m 0644 "$work/manifest.txt" "$MANIFEST"
+
+    if [[ ! -f "$CONF_BACKUP" ]]; then
+        install -o root -g root -m 0600 "$REFIND_CONF" "$CONF_BACKUP"
+    fi
+    if ! python3 - "$STANZA_PY" "$REFIND_CONF" "$stanza_file" <<'PY'
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+config = sys.argv[2]
+try:
+    stanza = open(sys.argv[3], encoding="utf-8").read()
+    original = open(config, encoding="utf-8").read()
+    updated = module.append_stanza(original, stanza)
+except module.StanzaError as exc:
+    raise SystemExit(str(exc))
+directory = os.path.dirname(config)
+mode = os.stat(config).st_mode & 0o777
+fd, temporary = tempfile.mkstemp(prefix=".refind.conf.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fchmod(handle.fileno(), mode)
+    os.replace(temporary, config)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+PY
+    then
+        rm -f -- "$EARLY_CPIO" "$COMBINED_INITRD" "$MANIFEST"
+        die "Did not append the stanza; removed the staged payload"
+    fi
+    printf 'Appended the s5 stanza. Stock icon, scan options, and default_selection were not rewritten.\n'
+}
+
+rewrite_owned_stanza() {
+    local stanza_file="$1"
+    python3 - "$STANZA_PY" "$REFIND_CONF" "$stanza_file" <<'PY'
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+config = sys.argv[2]
+try:
+    stanza = open(sys.argv[3], encoding="utf-8").read()
+    original = open(config, encoding="utf-8").read()
+    updated = module.replace_owned_stanza(original, stanza)
+except module.StanzaError as exc:
+    raise SystemExit(str(exc))
+directory = os.path.dirname(config)
+mode = os.stat(config).st_mode & 0o777
+fd, temporary = tempfile.mkstemp(prefix=".refind.conf.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fchmod(handle.fileno(), mode)
+    os.replace(temporary, config)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+internal_repair() {
+    local title="$1" work options stock
+    ((EUID == 0)) || die "internal repair must run as root"
+    (($# == 1)) || die "internal repair expects a menu title"
+    MENU_TITLE="$title"
+    validate_menu_title
+    [[ -f "$REFIND_CONF" && ! -L "$REFIND_CONF" ]] || die "rEFInd config is missing or is a symlink"
+    [[ -f "$EARLY_CPIO" && ! -L "$EARLY_CPIO" ]] || die "Early CPIO is missing or is a symlink"
+    preflight
+    need_cmd cmp
+    stock="/boot/initrd.img-${VOLUME_KERNEL}"
+    work="$(mktemp -d /tmp/omen-acpi-refind.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q' "$work")" RETURN
+    write_combined_initrd "$EARLY_CPIO" "$stock" "$work/s5-initrd.img"
+    install -o root -g root -m 0644 "$work/s5-initrd.img" "$COMBINED_INITRD"
+    options="$(linux_options)"
+    write_stanza "$work/stanza.txt" "$options"
+    rewrite_owned_stanza "$work/stanza.txt"
+    if [[ -f "$MANIFEST" && ! -L "$MANIFEST" ]]; then
+        python3 - "$MANIFEST" "$MENU_TITLE" "$VOLUME_KERNEL" \
+            "$(sha256sum -- "$COMBINED_INITRD" | awk '{print $1}')" <<'PY'
+from pathlib import Path
+import sys
+
+path, title, kernel, digest = sys.argv[1:]
+lines = Path(path).read_text(encoding="utf-8").splitlines()
+updates = {"TITLE": title, "KERNEL": kernel, "COMBINED_SHA256": digest}
+seen = set()
+rewritten = []
+for line in lines:
+    key, separator, _value = line.partition("=")
+    if separator and key in updates:
+        rewritten.append(f"{key}={updates[key]}")
+        seen.add(key)
+    else:
+        rewritten.append(line)
+for key, value in updates.items():
+    if key not in seen:
+        rewritten.append(f"{key}={value}")
+Path(path).write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+PY
+    fi
+    printf 'Rewrote the s5 stanza to load %s\n' "$COMBINED_INITRD"
+    printf 'The stock initrd was not modified: %s\n' "$stock"
+}
+
+internal_status() {
+    [[ "$EUID" -eq 0 || -r "$REFIND_CONF" ]] || die "Cannot read ${REFIND_CONF}"
+    python3 - "$STANZA_PY" "$REFIND_CONF" "$EARLY_CPIO" "$MANIFEST" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+text = open(sys.argv[2], encoding="utf-8").read()
+print("stanza=" + ("present" if module.BEGIN in text and module.END in text else "absent"))
+PY
+    if [[ -f "$EARLY_CPIO" && ! -L "$EARLY_CPIO" ]]; then
+        printf 'cpio=present %s\n' "$(sha256sum -- "$EARLY_CPIO" | awk '{print $1}')"
+    else
+        printf 'cpio=absent\n'
+    fi
+    if [[ -f "$MANIFEST" && ! -L "$MANIFEST" ]]; then
+        printf 'manifest=%s\n' "$MANIFEST"
+        cat -- "$MANIFEST"
+    else
+        printf 'manifest=absent\n'
+    fi
+    if grep -q 'omen-acpi/s5-initrd.img' /proc/cmdline 2>/dev/null; then
+        printf 'current_boot=s5-test\n'
+        printf 'Select the normal Linux icon on the next boot. rEFInd may remember this choice.\n'
+    else
+        printf 'current_boot=not-this-stanza\n'
+    fi
+}
+
+internal_remove() {
+    ((EUID == 0)) || die "internal remove must run as root"
+    [[ -f "$REFIND_CONF" && ! -L "$REFIND_CONF" ]] || die "rEFInd config is missing or is a symlink"
+    python3 - "$STANZA_PY" "$REFIND_CONF" <<'PY'
+import importlib.util
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("refind_stanza", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+config = sys.argv[2]
+original = open(config, encoding="utf-8").read()
+if module.BEGIN not in original and module.END not in original:
+    print("stanza=absent")
+    raise SystemExit(0)
+try:
+    updated = module.remove_stanza(original)
+except module.StanzaError as exc:
+    raise SystemExit(str(exc))
+directory = os.path.dirname(config)
+mode = os.stat(config).st_mode & 0o777
+fd, temporary = tempfile.mkstemp(prefix=".refind.conf.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fchmod(handle.fileno(), mode)
+    os.replace(temporary, config)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+print("stanza=removed")
+PY
+    if [[ -L "$EARLY_CPIO" || -L "$COMBINED_INITRD" || -L "$MANIFEST" || -L "$PAYLOAD_DIR" ]]; then
+        die "Refusing to delete a symlink in ${PAYLOAD_DIR}"
+    fi
+    [[ ! -e "$EARLY_CPIO" || -f "$EARLY_CPIO" ]] || die "Early CPIO path is not a regular file"
+    [[ ! -e "$COMBINED_INITRD" || -f "$COMBINED_INITRD" ]] || die "Combined initrd path is not a regular file"
+    [[ ! -e "$MANIFEST" || -f "$MANIFEST" ]] || die "Manifest path is not a regular file"
+    rm -f -- "$EARLY_CPIO" "$COMBINED_INITRD" "$MANIFEST"
+    if [[ -d "$PAYLOAD_DIR" ]]; then
+        if [[ -n "$(ls -A -- "$PAYLOAD_DIR")" ]]; then
+            printf 'Left %s in place because it still contains files.\n' "$PAYLOAD_DIR" >&2
+        else
+            rmdir -- "$PAYLOAD_DIR"
+        fi
+    fi
+    printf 'Removed the owned s5 payload. %s was not edited.\n' "$REFIND_LINUX_CONF"
+    printf 'A one-time copy, if created, remains at %s.\n' "$CONF_BACKUP"
+}
+
+if (($# < 1)); then
+    usage >&2
+    exit 2
 fi
+
+command="$1"
+shift
+case "$command" in
+    -h|--help|help)
+        usage
+        ;;
+    install)
+        cmd_install "$@"
+        ;;
+    repair)
+        cmd_repair "$@"
+        ;;
+    status)
+        cmd_status "$@"
+        ;;
+    remove)
+        cmd_remove "$@"
+        ;;
+    --internal-preflight)
+        internal_preflight "$@"
+        ;;
+    --internal-install)
+        internal_install "$@"
+        ;;
+    --internal-repair)
+        internal_repair "$@"
+        ;;
+    --internal-status)
+        internal_status "$@"
+        ;;
+    --internal-remove)
+        internal_remove "$@"
+        ;;
+    --internal-enable-startup-check)
+        enable_startup_check "$@"
+        ;;
+    --internal-disable-startup-check)
+        disable_startup_check "$@"
+        ;;
+    --internal-report-startup-check)
+        report_startup_check "$@"
+        ;;
+    *)
+        usage >&2
+        die "Unknown command: ${command}"
+        ;;
+esac

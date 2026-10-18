@@ -187,8 +187,8 @@ GPU. `NVPCF` is a separate `_DSM` and does not touch `NVDE`.
 
 ### What the measurement does not cover
 
-- It was measured with NVIDIA Open Kernel Module `610.43.03`
-  (`linux-cachyos-nvidia-open 7.1.5-1`, `nvidia-utils 610.43.03-1`) loaded.
+- It was measured with NVIDIA Open Kernel Module `610.43.03` loaded on the
+  original project's test machine.
   Without the NVIDIA driver, nothing sets `NVDE`, and `PG00._OFF()` powers
   nothing down.
 - A shutdown started within roughly 1.3 s of resume would fall before the

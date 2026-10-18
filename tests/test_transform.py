@@ -9,14 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-import struct
 import sys
 import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "scripts" / "02-build-dsdt.sh"
-MANAGER = ROOT / "scripts" / "03-manage-limine-entry.sh"
 
 FIXTURE = r'''DefinitionBlock ("", "DSDT", 2, "HPQOEM", "8E35    ", 0x01072009)
 {
@@ -82,12 +80,8 @@ def extract_transform(path: Path, marker: str) -> str:
 
 TRANSFORMS = {
     "builder": extract_transform(BUILDER, 'install -m 0600 "${source_files[0]}"'),
-    "manager": extract_transform(MANAGER, "build_variant_dsdt()"),
 }
 BUILDER_ROUNDTRIP_VERIFIER = extract_transform(BUILDER, "verify_roundtrip_semantics()")
-MANAGER_ROUNDTRIP_VERIFIER = extract_transform(
-    MANAGER, 'python3 - "$aml" "$roundtrip_dsl"'
-)
 
 
 def run_transform(code: str, source_text: str, variant: str, revision: str) -> subprocess.CompletedProcess[str]:
@@ -127,47 +121,8 @@ def run_builder_roundtrip_verifier(
         )
 
 
-def run_manager_roundtrip_verifier(
-    source_text: str, variant: str
-) -> subprocess.CompletedProcess[str]:
-    with tempfile.TemporaryDirectory(prefix="omen-manager-roundtrip-test.") as temporary:
-        directory = Path(temporary)
-        source = directory / "DSDT.dsl"
-        aml = directory / "DSDT.aml"
-        revision = 0x0107200A if variant == "s5" else 0x0107200B
-        source.write_text(source_text, encoding="utf-8")
-
-        data = bytearray(36)
-        data[0:4] = b"DSDT"
-        struct.pack_into("<I", data, 4, len(data))
-        data[8] = 2
-        data[10:16] = b"HPQOEM"
-        data[16:24] = b"8E35    "
-        struct.pack_into("<I", data, 24, revision)
-        data[28:32] = b"INTL"
-        struct.pack_into("<I", data, 32, 1)
-        data[9] = (-sum(data)) & 0xFF
-        aml.write_bytes(data)
-
-        return subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                MANAGER_ROUNDTRIP_VERIFIER,
-                str(aml),
-                str(source),
-                variant,
-                f"0x{revision:08X}",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-
 ROUNDTRIP_VERIFIERS = {
     "builder": run_builder_roundtrip_verifier,
-    "manager": run_manager_roundtrip_verifier,
 }
 
 
@@ -189,9 +144,6 @@ def verify_output(output: str, variant: str, revision: str) -> None:
 
 
 def main() -> None:
-    assert "iasl -dl -d DSDT.aml" in MANAGER.read_text(encoding="utf-8"), (
-        "manager round trip must use the legacy ASL dialect"
-    )
     transformed_outputs: dict[str, str] = {}
     for engine, code in TRANSFORMS.items():
         for variant, revision in (("s5", "0x0107200A"), ("combined", "0x0107200B")):
